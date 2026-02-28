@@ -15,6 +15,15 @@ Minimal npm-workspaces monorepo scaffold for the MVP.
 - Node.js 18+
 - npm 9+
 
+## Environment setup
+
+Copy `.env.example` to `.env.local` and set values for local development.
+
+Required Supabase variables for `apps/web` auth flow:
+
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+
 ## Quick start
 
 ```bash

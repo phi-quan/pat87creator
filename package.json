@@ -14,5 +14,8 @@
     "build:web": "npm run build --workspace @pat87creator/web",
     "build:worker-api": "npm run build --workspace @pat87creator/worker-api",
     "build:worker-consumer": "npm run build --workspace @pat87creator/worker-consumer"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.98.0"
   }
 }
