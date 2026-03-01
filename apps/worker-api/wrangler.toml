@@ -1,3 +1,7 @@
 name = "pat87creator-worker-api"
 main = "src/index.ts"
 compatibility_date = "2024-10-01"
+
+[[queues.producers]]
+binding = "VIDEO_JOB_QUEUE"
+queue = "video-job-queue"
