@@ -9,6 +9,20 @@ type CreateJobRpcResponse = {
   error: { message: string } | null;
 };
 
+type JobQueueMessage = {
+  job_id: string;
+  user_id: string;
+  payload: Record<string, unknown>;
+};
+
+type QueueBinding = {
+  send: (message: JobQueueMessage) => Promise<void>;
+};
+
+type RuntimeWithQueue = typeof globalThis & {
+  VIDEO_JOB_QUEUE?: QueueBinding;
+};
+
 const VIDEO_JOB_COST = 10;
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -33,6 +47,31 @@ function getBearerToken(request: Request): string | null {
 
 function isJsonObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function getQueueBinding(): QueueBinding | null {
+  const runtime = globalThis as RuntimeWithQueue;
+
+  return runtime.VIDEO_JOB_QUEUE ?? null;
+}
+
+function enqueueJob(message: JobQueueMessage): void {
+  const queue = getQueueBinding();
+
+  if (!queue) {
+    console.error('Queue binding VIDEO_JOB_QUEUE is not available', {
+      jobId: message.job_id
+    });
+    return;
+  }
+
+  void queue.send(message).catch((error: unknown) => {
+    console.error('Failed to enqueue video job', {
+      jobId: message.job_id,
+      userId: message.user_id,
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  });
 }
 
 export async function POST(request: Request) {
@@ -115,5 +154,13 @@ export async function POST(request: Request) {
     return Response.json({ error: 'Unable to create job' }, { status: 400 });
   }
 
-  return Response.json({ job_id: rpcResponse.data }, { status: 200 });
+  const jobId = rpcResponse.data;
+
+  enqueueJob({
+    job_id: jobId,
+    user_id: user.id,
+    payload: requestBody.payload
+  });
+
+  return Response.json({ job_id: jobId }, { status: 200 });
 }
