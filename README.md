@@ -24,6 +24,13 @@ Required Supabase variables for `apps/web` auth flow:
 - `NEXT_PUBLIC_SUPABASE_URL`
 - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
 
+Required Stripe webhook variables for `apps/web/app/api/stripe/webhook`:
+
+- `STRIPE_SECRET_KEY`
+- `STRIPE_WEBHOOK_SECRET`
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+
 ## Quick start
 
 ```bash
