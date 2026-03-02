@@ -8,20 +8,34 @@ type JobQueueMessage = {
   payload: Record<string, unknown>;
 };
 
+type JobResultPayload = {
+  artifact_path: string;
+  source: 'render' | 'existing_artifact';
+};
+
 type JobRow = {
   id: string;
   status: JobStatus;
   attempt_count: number;
   locked_at: string | null;
+  processing_token: string | null;
+  result_payload: JobResultPayload | null;
+};
+
+type StartedJob = {
+  attemptCount: number;
+  processingToken: string;
 };
 
 type Env = {
   NEXT_PUBLIC_SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
+  SUPABASE_ARTIFACT_BUCKET?: string;
 };
 
 const MAX_RETRIES = 3;
 const PROCESSING_TIMEOUT_MS = 5 * 60 * 1000;
+const DEFAULT_ARTIFACT_BUCKET = 'videos';
 
 function createServiceClient(env: Env) {
   return createClient(env.NEXT_PUBLIC_SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
@@ -32,6 +46,10 @@ function createServiceClient(env: Env) {
   });
 }
 
+function artifactPathForJob(jobId: string): string {
+  return `video_${jobId}.mp4`;
+}
+
 function isLockExpired(lockedAt: string | null): boolean {
   if (!lockedAt) {
     return true;
@@ -40,10 +58,26 @@ function isLockExpired(lockedAt: string | null): boolean {
   return Date.now() - new Date(lockedAt).getTime() >= PROCESSING_TIMEOUT_MS;
 }
 
-async function startProcessing(env: Env, job: JobRow): Promise<number> {
+async function fetchJob(env: Env, jobId: string): Promise<JobRow | null> {
+  const client = createServiceClient(env);
+  const { data, error } = await client
+    .from('jobs')
+    .select('id, status, attempt_count, locked_at, processing_token, result_payload')
+    .eq('id', jobId)
+    .maybeSingle<JobRow>();
+
+  if (error) {
+    throw new Error(`Unable to fetch job: ${error.message}`);
+  }
+
+  return data;
+}
+
+async function startProcessing(env: Env, job: JobRow): Promise<StartedJob> {
   const client = createServiceClient(env);
   const nextAttemptCount = job.attempt_count + 1;
   const nowIso = new Date().toISOString();
+  const processingToken = crypto.randomUUID();
 
   const { data, error } = await client
     .from('jobs')
@@ -52,23 +86,64 @@ async function startProcessing(env: Env, job: JobRow): Promise<number> {
       attempt_count: nextAttemptCount,
       last_attempt_at: nowIso,
       locked_at: nowIso,
+      processing_token: processingToken,
       error_message: null
     })
     .eq('id', job.id)
     .eq('status', job.status)
     .eq('attempt_count', job.attempt_count)
-    .select('attempt_count')
-    .maybeSingle<{ attempt_count: number }>();
+    .select('attempt_count, processing_token')
+    .maybeSingle<{ attempt_count: number; processing_token: string | null }>();
 
   if (error) {
     throw new Error(`Unable to set processing status: ${error.message}`);
   }
 
-  if (!data) {
+  if (!data?.processing_token) {
     throw new Error('Unable to claim job for processing due to concurrent update');
   }
 
-  return data.attempt_count;
+  return {
+    attemptCount: data.attempt_count,
+    processingToken: data.processing_token
+  };
+}
+
+async function artifactExists(env: Env, artifactPath: string): Promise<boolean> {
+  const client = createServiceClient(env);
+  const bucket = env.SUPABASE_ARTIFACT_BUCKET || DEFAULT_ARTIFACT_BUCKET;
+
+  const { data, error } = await client.storage.from(bucket).list('', {
+    search: artifactPath,
+    limit: 1
+  });
+
+  if (error) {
+    throw new Error(`Unable to check artifact existence: ${error.message}`);
+  }
+
+  return (data ?? []).some((file) => file.name === artifactPath);
+}
+
+async function persistResultPayload(
+  env: Env,
+  jobId: string,
+  attemptCount: number,
+  processingToken: string,
+  payload: JobResultPayload
+): Promise<void> {
+  const client = createServiceClient(env);
+  const { error } = await client
+    .from('jobs')
+    .update({ result_payload: payload })
+    .eq('id', jobId)
+    .eq('status', 'processing')
+    .eq('attempt_count', attemptCount)
+    .eq('processing_token', processingToken);
+
+  if (error) {
+    throw new Error(`Unable to persist result payload: ${error.message}`);
+  }
 }
 
 async function updateFinalStatus(
@@ -76,6 +151,7 @@ async function updateFinalStatus(
   jobId: string,
   status: 'queued' | 'completed' | 'failed',
   attemptCount: number,
+  processingToken: string,
   errorMessage?: string
 ): Promise<void> {
   const client = createServiceClient(env);
@@ -97,7 +173,8 @@ async function updateFinalStatus(
     .update(payload)
     .eq('id', jobId)
     .eq('attempt_count', attemptCount)
-    .eq('status', 'processing');
+    .eq('status', 'processing')
+    .eq('processing_token', processingToken);
 
   if (error) {
     throw new Error(`Unable to update job status: ${error.message}`);
@@ -115,26 +192,20 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
     throw new Error('Queue message missing job_id');
   }
 
-  const client = createServiceClient(env);
-  const { data: job, error: fetchError } = await client
-    .from('jobs')
-    .select('id, status, attempt_count, locked_at')
-    .eq('id', body.job_id)
-    .maybeSingle<JobRow>();
-
-  if (fetchError) {
-    throw new Error(`Unable to fetch job: ${fetchError.message}`);
-  }
+  const job = await fetchJob(env, body.job_id);
 
   if (!job) {
-    console.error('Job not found for queued message', { job_id: body.job_id });
+    console.error('Job not found for queued message', { job_id: body.job_id, transition_reason: 'missing_job' });
     return;
   }
 
   if (job.status === 'completed') {
     console.log('Skipping already completed job', {
       job_id: body.job_id,
+      processing_token: job.processing_token,
       attempt_count: job.attempt_count,
+      transition_reason: 'completed_guard',
+      skip_reason: 'already_completed',
       transition: 'completed -> completed'
     });
     return;
@@ -143,7 +214,10 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
   if (job.status === 'failed' && job.attempt_count >= MAX_RETRIES) {
     console.log('Skipping dead-lettered job', {
       job_id: body.job_id,
+      processing_token: job.processing_token,
       attempt_count: job.attempt_count,
+      transition_reason: 'dead_letter_guard',
+      skip_reason: 'max_retries_reached',
       transition: 'failed -> failed'
     });
     return;
@@ -152,7 +226,10 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
   if (job.status === 'processing' && !isLockExpired(job.locked_at)) {
     console.log('Skipping currently locked processing job', {
       job_id: body.job_id,
+      processing_token: job.processing_token,
       attempt_count: job.attempt_count,
+      transition_reason: 'lock_guard',
+      skip_reason: 'active_lock',
       transition: 'processing -> processing'
     });
     return;
@@ -162,33 +239,103 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
     return;
   }
 
-  let startedAttempt = job.attempt_count;
+  let started: StartedJob | null = null;
 
   try {
-    startedAttempt = await startProcessing(env, job);
+    started = await startProcessing(env, job);
 
     console.log('Transitioning job to processing', {
       job_id: body.job_id,
-      attempt_count: startedAttempt,
+      processing_token: started.processingToken,
+      attempt_count: started.attemptCount,
+      transition_reason: 'claim_for_attempt',
       transition: `${job.status} -> processing`
     });
 
+    const refreshedJob = await fetchJob(env, body.job_id);
+    if (!refreshedJob) {
+      throw new Error('Job disappeared after processing transition');
+    }
+
+    if (refreshedJob.status === 'completed') {
+      console.log('Skipping heavy processing for completed job', {
+        job_id: body.job_id,
+        processing_token: started.processingToken,
+        attempt_count: started.attemptCount,
+        transition_reason: 'post_claim_refresh',
+        skip_reason: 'already_completed'
+      });
+      return;
+    }
+
+    if (refreshedJob.result_payload) {
+      console.log('Result payload already exists, finalizing job without heavy processing', {
+        job_id: body.job_id,
+        processing_token: started.processingToken,
+        attempt_count: started.attemptCount,
+        transition_reason: 'result_payload_guard',
+        skip_reason: 'result_payload_exists'
+      });
+
+      await updateFinalStatus(env, body.job_id, 'completed', started.attemptCount, started.processingToken);
+      return;
+    }
+
+    const artifactPath = artifactPathForJob(body.job_id);
+    const existingArtifact = await artifactExists(env, artifactPath);
+
+    if (existingArtifact) {
+      const payload: JobResultPayload = {
+        artifact_path: artifactPath,
+        source: 'existing_artifact'
+      };
+
+      console.log('Artifact already exists, bypassing heavy processing', {
+        job_id: body.job_id,
+        processing_token: started.processingToken,
+        attempt_count: started.attemptCount,
+        transition_reason: 'artifact_exists_guard',
+        skip_reason: 'artifact_exists',
+        artifact_path: artifactPath
+      });
+
+      await persistResultPayload(env, body.job_id, started.attemptCount, started.processingToken, payload);
+      await updateFinalStatus(env, body.job_id, 'completed', started.attemptCount, started.processingToken);
+      return;
+    }
+
     await simulateProcessing();
 
-    await updateFinalStatus(env, body.job_id, 'completed', startedAttempt);
+    const payload: JobResultPayload = {
+      artifact_path: artifactPath,
+      source: 'render'
+    };
+
+    await persistResultPayload(env, body.job_id, started.attemptCount, started.processingToken, payload);
+    await updateFinalStatus(env, body.job_id, 'completed', started.attemptCount, started.processingToken);
 
     console.log('Transitioning job to completed', {
       job_id: body.job_id,
-      attempt_count: startedAttempt,
-      transition: 'processing -> completed'
+      processing_token: started.processingToken,
+      attempt_count: started.attemptCount,
+      transition_reason: 'external_work_success',
+      transition: 'processing -> completed',
+      artifact_path: artifactPath
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown processing failure';
-    const nextStatus: 'queued' | 'failed' = startedAttempt < MAX_RETRIES ? 'queued' : 'failed';
+
+    if (!started) {
+      throw error;
+    }
+
+    const nextStatus: 'queued' | 'failed' = started.attemptCount < MAX_RETRIES ? 'queued' : 'failed';
 
     console.error('Video job processing failed', {
       job_id: body.job_id,
-      attempt_count: startedAttempt,
+      processing_token: started.processingToken,
+      attempt_count: started.attemptCount,
+      transition_reason: 'processing_error',
       transition: `processing -> ${nextStatus}`,
       error: errorMessage
     });
@@ -197,7 +344,8 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
       env,
       body.job_id,
       nextStatus,
-      startedAttempt,
+      started.attemptCount,
+      started.processingToken,
       nextStatus === 'failed' ? errorMessage : undefined
     );
   }
