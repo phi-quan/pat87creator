@@ -23,6 +23,12 @@ type JobRow = {
   processing_started_at: string | null;
 };
 
+type FinalizeEconomicsRow = {
+  total_cost_usd: number;
+  revenue_usd: number;
+  margin_usd: number;
+};
+
 type StartedJob = {
   attemptCount: number;
   processingToken: string;
@@ -38,6 +44,8 @@ type Env = {
 const MAX_RETRIES = 3;
 const PROCESSING_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_ARTIFACT_BUCKET = 'videos';
+const COMPUTE_COST_PER_SECOND_USD = 0.0004;
+const CREDIT_PRICE_USD = 0.01;
 
 function createServiceClient(env: Env) {
   return createClient(env.NEXT_PUBLIC_SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
@@ -158,7 +166,7 @@ async function updateFinalStatus(
   processingToken: string,
   processingStartedAt: string,
   errorMessage?: string
-): Promise<void> {
+): Promise<number> {
   const client = createServiceClient(env);
   const payload: {
     status: 'queued' | 'completed' | 'failed';
@@ -195,6 +203,34 @@ async function updateFinalStatus(
   if (error) {
     throw new Error(`Unable to update job status: ${error.message}`);
   }
+
+  return durationMs;
+}
+
+async function finalizeJobEconomics(env: Env, jobId: string, executionDurationMs: number): Promise<void> {
+  const client = createServiceClient(env);
+  const computeCostUsd = (executionDurationMs / 1000) * COMPUTE_COST_PER_SECOND_USD;
+
+  const { data, error } = await client.rpc('finalize_job_economics', {
+    p_job_id: jobId,
+    p_compute_cost_usd: computeCostUsd,
+    p_storage_cost_usd: 0,
+    p_external_api_cost_usd: 0,
+    p_credit_price_usd: CREDIT_PRICE_USD
+  });
+
+  if (error) {
+    throw new Error(`Unable to finalize job economics: ${error.message}`);
+  }
+
+  const result = (Array.isArray(data) ? data[0] : data) as FinalizeEconomicsRow | null;
+  console.log('Job economics finalized', {
+    job_id: jobId,
+    execution_duration_ms: executionDurationMs,
+    total_cost_usd: result?.total_cost_usd ?? null,
+    revenue_usd: result?.revenue_usd ?? null,
+    margin_usd: result?.margin_usd ?? null
+  });
 }
 
 async function simulateProcessing(): Promise<void> {
@@ -293,7 +329,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
         skip_reason: 'result_payload_exists'
       });
 
-      await updateFinalStatus(
+      const durationMs = await updateFinalStatus(
         env,
         body.job_id,
         'completed',
@@ -301,6 +337,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
         started.processingToken,
         started.processingStartedAt
       );
+      await finalizeJobEconomics(env, body.job_id, durationMs);
       return;
     }
 
@@ -323,7 +360,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
       });
 
       await persistResultPayload(env, body.job_id, started.attemptCount, started.processingToken, payload);
-      await updateFinalStatus(
+      const durationMs = await updateFinalStatus(
         env,
         body.job_id,
         'completed',
@@ -331,6 +368,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
         started.processingToken,
         started.processingStartedAt
       );
+      await finalizeJobEconomics(env, body.job_id, durationMs);
       return;
     }
 
@@ -342,7 +380,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
     };
 
     await persistResultPayload(env, body.job_id, started.attemptCount, started.processingToken, payload);
-    await updateFinalStatus(
+    const durationMs = await updateFinalStatus(
       env,
       body.job_id,
       'completed',
@@ -350,6 +388,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
       started.processingToken,
       started.processingStartedAt
     );
+    await finalizeJobEconomics(env, body.job_id, durationMs);
 
     console.log('Transitioning job to completed', {
       job_id: body.job_id,
