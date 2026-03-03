@@ -1,9 +1,12 @@
 'use client';
 
 import { FormEvent, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { supabase } from '../../lib/supabase';
+import { setAccessTokenCookie } from '../../lib/authCookie';
 
 export default function LoginPage() {
+  const router = useRouter();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [message, setMessage] = useState('');
@@ -12,14 +15,20 @@ export default function LoginPage() {
     event.preventDefault();
     setMessage('Logging in...');
 
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
 
     if (error) {
       setMessage(error.message);
       return;
     }
 
-    setMessage('Login successful.');
+    if (data.session?.access_token) {
+      setAccessTokenCookie(data.session.access_token);
+    }
+
+    setMessage('Login successful. Redirecting...');
+    router.replace('/dashboard');
+    router.refresh();
   };
 
   return (
