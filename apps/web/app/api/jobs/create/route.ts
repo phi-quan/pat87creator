@@ -9,6 +9,14 @@ type CreateJobRpcResponse = {
   error: { message: string } | null;
 };
 
+type RateLimitCode = 'jobs_per_minute' | 'concurrent_jobs' | 'daily_credits';
+
+type RateLimitErrorResponse = {
+  error: 'rate_limit_exceeded';
+  code: RateLimitCode;
+  message: string;
+};
+
 type JobQueueMessage = {
   job_id: string;
   user_id: string;
@@ -24,6 +32,7 @@ type RuntimeWithQueue = typeof globalThis & {
 };
 
 const VIDEO_JOB_COST = 10;
+const RATE_LIMIT_PREFIX = 'RATE_LIMIT_EXCEEDED|';
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
@@ -72,6 +81,28 @@ function enqueueJob(message: JobQueueMessage): void {
       message: error instanceof Error ? error.message : 'Unknown error'
     });
   });
+}
+
+function parseRateLimitError(message: string | undefined): RateLimitErrorResponse | null {
+  if (!message?.startsWith(RATE_LIMIT_PREFIX)) {
+    return null;
+  }
+
+  const [, code, userMessage] = message.split('|');
+
+  if (
+    code !== 'jobs_per_minute' &&
+    code !== 'concurrent_jobs' &&
+    code !== 'daily_credits'
+  ) {
+    return null;
+  }
+
+  return {
+    error: 'rate_limit_exceeded',
+    code,
+    message: userMessage ?? 'Rate limit exceeded'
+  };
 }
 
 export async function POST(request: Request) {
@@ -143,6 +174,11 @@ export async function POST(request: Request) {
       userId: user.id,
       message: rpcResponse.error?.message
     });
+
+    const rateLimitError = parseRateLimitError(rpcResponse.error?.message);
+    if (rateLimitError) {
+      return Response.json(rateLimitError, { status: 429 });
+    }
 
     const isInsufficientCredits =
       rpcResponse.error?.message?.toLowerCase().includes('insufficient credits') ?? false;
