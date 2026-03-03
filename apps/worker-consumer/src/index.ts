@@ -20,11 +20,13 @@ type JobRow = {
   locked_at: string | null;
   processing_token: string | null;
   result_payload: JobResultPayload | null;
+  processing_started_at: string | null;
 };
 
 type StartedJob = {
   attemptCount: number;
   processingToken: string;
+  processingStartedAt: string;
 };
 
 type Env = {
@@ -62,7 +64,7 @@ async function fetchJob(env: Env, jobId: string): Promise<JobRow | null> {
   const client = createServiceClient(env);
   const { data, error } = await client
     .from('jobs')
-    .select('id, status, attempt_count, locked_at, processing_token, result_payload')
+    .select('id, status, attempt_count, locked_at, processing_token, result_payload, processing_started_at')
     .eq('id', jobId)
     .maybeSingle<JobRow>();
 
@@ -87,7 +89,8 @@ async function startProcessing(env: Env, job: JobRow): Promise<StartedJob> {
       last_attempt_at: nowIso,
       locked_at: nowIso,
       processing_token: processingToken,
-      error_message: null
+      error_message: null,
+      processing_started_at: nowIso
     })
     .eq('id', job.id)
     .eq('status', job.status)
@@ -105,7 +108,8 @@ async function startProcessing(env: Env, job: JobRow): Promise<StartedJob> {
 
   return {
     attemptCount: data.attempt_count,
-    processingToken: data.processing_token
+    processingToken: data.processing_token,
+    processingStartedAt: nowIso
   };
 }
 
@@ -152,6 +156,7 @@ async function updateFinalStatus(
   status: 'queued' | 'completed' | 'failed',
   attemptCount: number,
   processingToken: string,
+  processingStartedAt: string,
   errorMessage?: string
 ): Promise<void> {
   const client = createServiceClient(env);
@@ -159,13 +164,24 @@ async function updateFinalStatus(
     status: 'queued' | 'completed' | 'failed';
     locked_at: null;
     error_message?: string | null;
+    processing_completed_at?: string | null;
+    execution_duration_ms?: number | null;
   } = {
     status,
     locked_at: null
   };
 
+  const processingCompletedAt = new Date().toISOString();
+  const durationMs = Math.max(0, new Date(processingCompletedAt).getTime() - new Date(processingStartedAt).getTime());
+  payload.processing_completed_at = processingCompletedAt;
+  payload.execution_duration_ms = durationMs;
+
   if (status === 'failed') {
     payload.error_message = errorMessage ?? 'Unknown worker failure';
+  }
+
+  if (status === 'queued') {
+    payload.error_message = null;
   }
 
   const { error } = await client
@@ -277,7 +293,14 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
         skip_reason: 'result_payload_exists'
       });
 
-      await updateFinalStatus(env, body.job_id, 'completed', started.attemptCount, started.processingToken);
+      await updateFinalStatus(
+        env,
+        body.job_id,
+        'completed',
+        started.attemptCount,
+        started.processingToken,
+        started.processingStartedAt
+      );
       return;
     }
 
@@ -300,7 +323,14 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
       });
 
       await persistResultPayload(env, body.job_id, started.attemptCount, started.processingToken, payload);
-      await updateFinalStatus(env, body.job_id, 'completed', started.attemptCount, started.processingToken);
+      await updateFinalStatus(
+        env,
+        body.job_id,
+        'completed',
+        started.attemptCount,
+        started.processingToken,
+        started.processingStartedAt
+      );
       return;
     }
 
@@ -312,7 +342,14 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
     };
 
     await persistResultPayload(env, body.job_id, started.attemptCount, started.processingToken, payload);
-    await updateFinalStatus(env, body.job_id, 'completed', started.attemptCount, started.processingToken);
+    await updateFinalStatus(
+      env,
+      body.job_id,
+      'completed',
+      started.attemptCount,
+      started.processingToken,
+      started.processingStartedAt
+    );
 
     console.log('Transitioning job to completed', {
       job_id: body.job_id,
@@ -346,6 +383,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
       nextStatus,
       started.attemptCount,
       started.processingToken,
+      started.processingStartedAt,
       nextStatus === 'failed' ? errorMessage : undefined
     );
   }
