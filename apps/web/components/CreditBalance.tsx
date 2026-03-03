@@ -33,15 +33,8 @@ export function CreditBalance({ refreshKey }: CreditBalanceProps) {
       }
     });
 
-    if (response.status === 401) {
-      setErrorMessage('Session expired. Please log in again.');
-      setCredits(null);
-      setIsLoading(false);
-      return;
-    }
-
     if (!response.ok) {
-      setErrorMessage('Unable to load credits right now.');
+      setErrorMessage(response.status === 401 ? 'Session expired. Please log in again.' : 'Unable to load credits right now.');
       setCredits(null);
       setIsLoading(false);
       return;
@@ -57,7 +50,7 @@ export function CreditBalance({ refreshKey }: CreditBalanceProps) {
   }, [loadCredits, refreshKey]);
 
   if (isLoading) {
-    return <p>Credits: Loading...</p>;
+    return <div style={{ height: 24, width: 140, borderRadius: 8, background: '#f3f4f6', marginBottom: 12 }} />;
   }
 
   if (errorMessage) {
