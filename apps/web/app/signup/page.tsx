@@ -1,9 +1,12 @@
 'use client';
 
 import { FormEvent, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { supabase } from '../../lib/supabase';
+import { setAccessTokenCookie } from '../../lib/authCookie';
 
 export default function SignupPage() {
+  const router = useRouter();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [message, setMessage] = useState('');
@@ -12,10 +15,17 @@ export default function SignupPage() {
     event.preventDefault();
     setMessage('Signing up...');
 
-    const { error } = await supabase.auth.signUp({ email, password });
+    const { data, error } = await supabase.auth.signUp({ email, password });
 
     if (error) {
       setMessage(error.message);
+      return;
+    }
+
+    if (data.session?.access_token) {
+      setAccessTokenCookie(data.session.access_token);
+      router.replace('/dashboard');
+      router.refresh();
       return;
     }
 
