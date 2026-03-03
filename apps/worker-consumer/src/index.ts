@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import { log } from '@pat87creator/logger';
 
 type JobStatus = 'queued' | 'processing' | 'completed' | 'failed';
 
@@ -46,6 +47,14 @@ const PROCESSING_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_ARTIFACT_BUCKET = 'videos';
 const COMPUTE_COST_PER_SECOND_USD = 0.0004;
 const CREDIT_PRICE_USD = 0.01;
+
+if ('addEventListener' in globalThis) {
+  globalThis.addEventListener('unhandledrejection', (event) => {
+    log('error', 'Unhandled promise rejection in worker-consumer', {
+      reason: event.reason instanceof Error ? event.reason.message : 'unknown_reason'
+    });
+  });
+}
 
 function createServiceClient(env: Env) {
   return createClient(env.NEXT_PUBLIC_SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
@@ -224,7 +233,7 @@ async function finalizeJobEconomics(env: Env, jobId: string, executionDurationMs
   }
 
   const result = (Array.isArray(data) ? data[0] : data) as FinalizeEconomicsRow | null;
-  console.log('Job economics finalized', {
+  log('info', 'Job economics finalized', {
     job_id: jobId,
     execution_duration_ms: executionDurationMs,
     total_cost_usd: result?.total_cost_usd ?? null,
@@ -247,12 +256,12 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
   const job = await fetchJob(env, body.job_id);
 
   if (!job) {
-    console.error('Job not found for queued message', { job_id: body.job_id, transition_reason: 'missing_job' });
+    log('error', 'Job not found for queued message', { job_id: body.job_id, transition_reason: 'missing_job' });
     return;
   }
 
   if (job.status === 'completed') {
-    console.log('Skipping already completed job', {
+    log('info', 'Skipping already completed job', {
       job_id: body.job_id,
       processing_token: job.processing_token,
       attempt_count: job.attempt_count,
@@ -264,7 +273,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
   }
 
   if (job.status === 'failed' && job.attempt_count >= MAX_RETRIES) {
-    console.log('Skipping dead-lettered job', {
+    log('info', 'Skipping dead-lettered job', {
       job_id: body.job_id,
       processing_token: job.processing_token,
       attempt_count: job.attempt_count,
@@ -276,7 +285,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
   }
 
   if (job.status === 'processing' && !isLockExpired(job.locked_at)) {
-    console.log('Skipping currently locked processing job', {
+    log('info', 'Skipping currently locked processing job', {
       job_id: body.job_id,
       processing_token: job.processing_token,
       attempt_count: job.attempt_count,
@@ -296,7 +305,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
   try {
     started = await startProcessing(env, job);
 
-    console.log('Transitioning job to processing', {
+    log('info', 'Transitioning job to processing', {
       job_id: body.job_id,
       processing_token: started.processingToken,
       attempt_count: started.attemptCount,
@@ -310,7 +319,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
     }
 
     if (refreshedJob.status === 'completed') {
-      console.log('Skipping heavy processing for completed job', {
+      log('info', 'Skipping heavy processing for completed job', {
         job_id: body.job_id,
         processing_token: started.processingToken,
         attempt_count: started.attemptCount,
@@ -321,7 +330,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
     }
 
     if (refreshedJob.result_payload) {
-      console.log('Result payload already exists, finalizing job without heavy processing', {
+      log('info', 'Result payload already exists, finalizing job without heavy processing', {
         job_id: body.job_id,
         processing_token: started.processingToken,
         attempt_count: started.attemptCount,
@@ -350,7 +359,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
         source: 'existing_artifact'
       };
 
-      console.log('Artifact already exists, bypassing heavy processing', {
+      log('info', 'Artifact already exists, bypassing heavy processing', {
         job_id: body.job_id,
         processing_token: started.processingToken,
         attempt_count: started.attemptCount,
@@ -390,7 +399,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
     );
     await finalizeJobEconomics(env, body.job_id, durationMs);
 
-    console.log('Transitioning job to completed', {
+    log('info', 'Transitioning job to completed', {
       job_id: body.job_id,
       processing_token: started.processingToken,
       attempt_count: started.attemptCount,
@@ -407,7 +416,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
 
     const nextStatus: 'queued' | 'failed' = started.attemptCount < MAX_RETRIES ? 'queued' : 'failed';
 
-    console.error('Video job processing failed', {
+    log('error', 'Video job processing failed', {
       job_id: body.job_id,
       processing_token: started.processingToken,
       attempt_count: started.attemptCount,
@@ -416,22 +425,38 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
       error: errorMessage
     });
 
-    await updateFinalStatus(
-      env,
-      body.job_id,
-      nextStatus,
-      started.attemptCount,
-      started.processingToken,
-      started.processingStartedAt,
-      nextStatus === 'failed' ? errorMessage : undefined
-    );
+    try {
+      await updateFinalStatus(
+        env,
+        body.job_id,
+        nextStatus,
+        started.attemptCount,
+        started.processingToken,
+        started.processingStartedAt,
+        nextStatus === 'failed' ? errorMessage : undefined
+      );
+
+      if (nextStatus === 'failed') {
+        log('warn', 'Job transitioned to dead-letter state', {
+          job_id: body.job_id,
+          attempt_count: started.attemptCount,
+          transition: 'processing -> failed'
+        });
+      }
+    } catch (finalizeError) {
+      log('error', 'Failed to finalize job status after processing error', {
+        job_id: body.job_id,
+        error: finalizeError instanceof Error ? finalizeError.message : 'unknown_finalize_error'
+      });
+      throw finalizeError;
+    }
   }
 }
 
 export default {
   async queue(batch: MessageBatch<JobQueueMessage>, env: Env): Promise<void> {
     if (!env.NEXT_PUBLIC_SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
-      console.error('Missing required worker environment variables');
+      log('error', 'Missing required worker environment variables');
       return;
     }
 
@@ -440,7 +465,7 @@ export default {
         await processMessage(message, env);
         message.ack();
       } catch (error) {
-        console.error('Unhandled queue message error', {
+        log('error', 'Unhandled queue message error', {
           message: error instanceof Error ? error.message : 'Unknown error'
         });
         message.retry();

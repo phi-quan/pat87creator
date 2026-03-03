@@ -1,18 +1,13 @@
 import { createClient } from '@supabase/supabase-js';
+import { getRequiredEnv } from '@pat87creator/config/env';
+import { withSafeApiHandler } from '../_lib/safeHandler';
 
 type CreditRow = {
   credits_remaining: number | null;
 };
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-
-function missingEnvResponse(name: string) {
-  return Response.json(
-    { error: `Missing required environment variable: ${name}` },
-    { status: 500 }
-  );
-}
+const supabaseUrl = getRequiredEnv('NEXT_PUBLIC_SUPABASE_URL');
+const supabaseAnonKey = getRequiredEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY');
 
 function getBearerToken(request: Request): string | null {
   const authorizationHeader = request.headers.get('authorization');
@@ -23,15 +18,7 @@ function getBearerToken(request: Request): string | null {
   return authorizationHeader.slice('Bearer '.length).trim() || null;
 }
 
-export async function GET(request: Request) {
-  if (!supabaseUrl) {
-    return missingEnvResponse('NEXT_PUBLIC_SUPABASE_URL');
-  }
-
-  if (!supabaseAnonKey) {
-    return missingEnvResponse('NEXT_PUBLIC_SUPABASE_ANON_KEY');
-  }
-
+export const GET = withSafeApiHandler('/api/credits', async (request: Request) => {
   const accessToken = getBearerToken(request);
   if (!accessToken) {
     return Response.json({ error: 'Unauthorized' }, { status: 401 });
@@ -69,4 +56,4 @@ export async function GET(request: Request) {
   }
 
   return Response.json({ credits_remaining: data?.credits_remaining ?? 0 }, { status: 200 });
-}
+});
