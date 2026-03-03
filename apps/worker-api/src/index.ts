@@ -30,6 +30,10 @@ type MetricsRow = {
   queued: number;
   avg_execution_ms: number;
   retry_rate: number;
+  total_cost_usd: number;
+  total_revenue_usd: number;
+  total_margin_usd: number;
+  avg_margin_per_job: number;
 };
 
 const DEFAULT_PAGE = 1;
@@ -187,7 +191,11 @@ async function handleAdminMetrics(request: Request, env: Env): Promise<Response>
     processing: data?.processing ?? 0,
     queued: data?.queued ?? 0,
     avg_execution_ms: data?.avg_execution_ms ?? 0,
-    retry_rate: data?.retry_rate ?? 0
+    retry_rate: data?.retry_rate ?? 0,
+    total_cost_usd: data?.total_cost_usd ?? 0,
+    total_revenue_usd: data?.total_revenue_usd ?? 0,
+    total_margin_usd: data?.total_margin_usd ?? 0,
+    avg_margin_per_job: data?.avg_margin_per_job ?? 0
   });
 }
 
