@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import { getRequiredEnv } from '@pat87creator/config/env';
 import { withSafeApiHandler } from '../../_lib/safeHandler';
+import { buildBillingReconciliationReport } from '../reconcile/_lib/reconciliation';
 
 type JobStatus = 'queued' | 'processing' | 'completed' | 'failed';
 
@@ -127,6 +128,8 @@ export const GET = withSafeApiHandler('/api/admin/monitoring', async (request: R
     fetchSystemHealth(adminSecret, request)
   ]);
 
+  const billingIntegrity = await buildBillingReconciliationReport();
+
   if (jobsResult.error) {
     return Response.json({ error: 'internal_server_error' }, { status: 500 });
   }
@@ -191,6 +194,15 @@ export const GET = withSafeApiHandler('/api/admin/monitoring', async (request: R
     revenue_today_usd: Number(revenueToday.toFixed(2)),
     cost_today_usd: Number(costToday.toFixed(2)),
     margin_today_usd: Number((revenueToday - costToday).toFixed(2)),
+    billing_integrity: {
+      payments_verified: billingIntegrity.payments_checked,
+      credit_mismatches: billingIntegrity.credit_mismatches,
+      revenue_mismatch: billingIntegrity.revenue_mismatch,
+      anomaly_count: billingIntegrity.anomalies.length,
+      negative_margin_jobs: billingIntegrity.negative_margin_jobs,
+      credits_verified: billingIntegrity.credits_verified,
+      last_reconciled_at: billingIntegrity.generated_at
+    },
     system_health: health,
     refreshed_at: new Date().toISOString()
   });
