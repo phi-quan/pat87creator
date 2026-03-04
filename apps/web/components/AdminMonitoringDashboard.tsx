@@ -23,6 +23,15 @@ type MonitoringResponse = {
   revenue_today_usd: number;
   cost_today_usd: number;
   margin_today_usd: number;
+  billing_integrity: {
+    payments_verified: number;
+    credit_mismatches: number;
+    revenue_mismatch: boolean;
+    anomaly_count: number;
+    negative_margin_jobs: number;
+    credits_verified: boolean;
+    last_reconciled_at: string;
+  };
   system_health: {
     db: boolean;
     queue: boolean;
@@ -159,6 +168,21 @@ export function AdminMonitoringDashboard({ adminSecret }: { adminSecret: string 
           <StatCard title="Cost (today)" value={`$${data.cost_today_usd.toFixed(2)}`} />
           <StatCard title="Margin (today)" value={`$${data.margin_today_usd.toFixed(2)}`} />
         </div>
+      </section>
+
+      <section style={{ display: 'grid', gap: 12 }}>
+        <h2 style={{ margin: 0 }}>Billing Integrity</h2>
+        <div style={{ display: 'grid', gap: 12, gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))' }}>
+          <StatCard title="Payments verified" value={data.billing_integrity.payments_verified} />
+          <StatCard title="Credit mismatches" value={data.billing_integrity.credit_mismatches} />
+          <StatCard title="Revenue mismatch" value={data.billing_integrity.revenue_mismatch ? 'Yes' : 'No'} />
+          <StatCard title="Anomalies" value={data.billing_integrity.anomaly_count} />
+          <StatCard title="Negative margin jobs" value={data.billing_integrity.negative_margin_jobs} />
+          <StatCard title="Credits verified" value={data.billing_integrity.credits_verified ? 'Yes' : 'No'} />
+        </div>
+        <p style={{ margin: 0, color: '#6b7280', fontSize: 12 }}>
+          Last reconciled: {new Date(data.billing_integrity.last_reconciled_at).toLocaleString()}
+        </p>
       </section>
 
       <p style={{ margin: 0, color: '#6b7280', fontSize: 12 }}>
