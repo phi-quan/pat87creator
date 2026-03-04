@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import { dispatchAlert } from '@pat87creator/alerts/dispatcher';
 import { getRequiredEnv } from '@pat87creator/config/env';
 import { log } from '@pat87creator/logger';
 import { withSafeApiHandler } from '../../_lib/safeHandler';
@@ -8,6 +9,9 @@ const stripeSecretKey = getRequiredEnv('STRIPE_SECRET_KEY');
 const stripeWebhookSecret = getRequiredEnv('STRIPE_WEBHOOK_SECRET');
 const supabaseUrl = getRequiredEnv('NEXT_PUBLIC_SUPABASE_URL');
 const supabaseServiceRoleKey = getRequiredEnv('SUPABASE_SERVICE_ROLE_KEY');
+
+const alertSlackWebhookUrl = process.env.ALERT_SLACK_WEBHOOK_URL;
+const alertEmailTo = process.env.ALERT_EMAIL_TO;
 
 const stripe = new Stripe(stripeSecretKey, {
   apiVersion: '2024-06-20'
@@ -21,12 +25,40 @@ export const POST = withSafeApiHandler('/api/stripe/webhook', async (request: Re
   const contentType = request.headers.get('content-type') ?? '';
   if (!contentType.toLowerCase().startsWith('application/json')) {
     log('warn', 'Rejected Stripe webhook invalid content-type', { route: '/api/stripe/webhook', content_type: contentType });
+    await dispatchAlert(
+      {
+        severity: 'warning',
+        service: 'stripe',
+        event: 'webhook_failure',
+        message: 'Stripe Webhook Verification Failure',
+        metadata: {
+          route: '/api/stripe/webhook',
+          reason: 'invalid_content_type',
+          timestamp: new Date().toISOString()
+        }
+      },
+      { ALERT_SLACK_WEBHOOK_URL: alertSlackWebhookUrl, ALERT_EMAIL_TO: alertEmailTo }
+    );
     return new Response('Invalid content-type', { status: 415 });
   }
 
   const signature = request.headers.get('stripe-signature');
   if (!signature) {
     log('warn', 'Rejected Stripe webhook missing signature', { route: '/api/stripe/webhook' });
+    await dispatchAlert(
+      {
+        severity: 'warning',
+        service: 'stripe',
+        event: 'webhook_failure',
+        message: 'Stripe Webhook Verification Failure',
+        metadata: {
+          route: '/api/stripe/webhook',
+          reason: 'missing_signature',
+          timestamp: new Date().toISOString()
+        }
+      },
+      { ALERT_SLACK_WEBHOOK_URL: alertSlackWebhookUrl, ALERT_EMAIL_TO: alertEmailTo }
+    );
     return new Response('Missing Stripe signature header', { status: 400 });
   }
 
@@ -37,6 +69,21 @@ export const POST = withSafeApiHandler('/api/stripe/webhook', async (request: Re
     event = stripe.webhooks.constructEvent(rawBody, signature, stripeWebhookSecret);
   } catch {
     log('warn', 'Stripe webhook signature verification failed', { route: '/api/stripe/webhook' });
+    await dispatchAlert(
+      {
+        severity: 'warning',
+        service: 'stripe',
+        event: 'webhook_failure',
+        message: 'Stripe Webhook Verification Failure',
+        metadata: {
+          route: '/api/stripe/webhook',
+          reason: 'signature_verification_failed',
+          source_ip: request.headers.get('x-forwarded-for') ?? request.headers.get('cf-connecting-ip') ?? 'unknown',
+          timestamp: new Date().toISOString()
+        }
+      },
+      { ALERT_SLACK_WEBHOOK_URL: alertSlackWebhookUrl, ALERT_EMAIL_TO: alertEmailTo }
+    );
     return new Response('Invalid Stripe signature', { status: 400 });
   }
 
@@ -79,6 +126,21 @@ export const POST = withSafeApiHandler('/api/stripe/webhook', async (request: Re
 
   if (error) {
     log('warn', 'Stripe webhook process_stripe_payment RPC failed', { route: '/api/stripe/webhook', provider_reference: event.id });
+    await dispatchAlert(
+      {
+        severity: 'warning',
+        service: 'stripe',
+        event: 'webhook_failure',
+        message: 'Stripe Webhook Handler Failure',
+        metadata: {
+          route: '/api/stripe/webhook',
+          event_id: event.id,
+          error_message: error.message,
+          timestamp: new Date().toISOString()
+        }
+      },
+      { ALERT_SLACK_WEBHOOK_URL: alertSlackWebhookUrl, ALERT_EMAIL_TO: alertEmailTo }
+    );
   }
 
   return new Response('Webhook handled', { status: 200 });

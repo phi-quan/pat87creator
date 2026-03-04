@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "@pat87creator/config": "0.1.0",
-    "@pat87creator/logger": "0.1.0"
+    "@pat87creator/logger": "0.1.0",
+    "@pat87creator/alerts": "0.1.0"
   }
 }
