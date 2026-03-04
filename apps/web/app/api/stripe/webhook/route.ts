@@ -1,38 +1,32 @@
 import { createClient } from '@supabase/supabase-js';
+import { getRequiredEnv } from '@pat87creator/config/env';
+import { log } from '@pat87creator/logger';
+import { withSafeApiHandler } from '../../_lib/safeHandler';
 import Stripe from 'stripe';
 
-const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
-const stripeWebhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const stripeSecretKey = getRequiredEnv('STRIPE_SECRET_KEY');
+const stripeWebhookSecret = getRequiredEnv('STRIPE_WEBHOOK_SECRET');
+const supabaseUrl = getRequiredEnv('NEXT_PUBLIC_SUPABASE_URL');
+const supabaseServiceRoleKey = getRequiredEnv('SUPABASE_SERVICE_ROLE_KEY');
 
-const stripe = new Stripe(stripeSecretKey ?? '', {
+const stripe = new Stripe(stripeSecretKey, {
   apiVersion: '2024-06-20'
 });
 
-function missingEnvResponse(name: string) {
-  return new Response(`Missing required environment variable: ${name}`, { status: 500 });
+export async function GET() {
+  return new Response('Method not allowed', { status: 405 });
 }
 
-export async function POST(request: Request) {
-  if (!stripeSecretKey) {
-    return missingEnvResponse('STRIPE_SECRET_KEY');
-  }
-
-  if (!stripeWebhookSecret) {
-    return missingEnvResponse('STRIPE_WEBHOOK_SECRET');
-  }
-
-  if (!supabaseUrl) {
-    return missingEnvResponse('NEXT_PUBLIC_SUPABASE_URL');
-  }
-
-  if (!supabaseServiceRoleKey) {
-    return missingEnvResponse('SUPABASE_SERVICE_ROLE_KEY');
+export const POST = withSafeApiHandler('/api/stripe/webhook', async (request: Request) => {
+  const contentType = request.headers.get('content-type') ?? '';
+  if (!contentType.toLowerCase().startsWith('application/json')) {
+    log('warn', 'Rejected Stripe webhook invalid content-type', { route: '/api/stripe/webhook', content_type: contentType });
+    return new Response('Invalid content-type', { status: 415 });
   }
 
   const signature = request.headers.get('stripe-signature');
   if (!signature) {
+    log('warn', 'Rejected Stripe webhook missing signature', { route: '/api/stripe/webhook' });
     return new Response('Missing Stripe signature header', { status: 400 });
   }
 
@@ -42,13 +36,11 @@ export async function POST(request: Request) {
   try {
     event = stripe.webhooks.constructEvent(rawBody, signature, stripeWebhookSecret);
   } catch {
+    log('warn', 'Stripe webhook signature verification failed', { route: '/api/stripe/webhook' });
     return new Response('Invalid Stripe signature', { status: 400 });
   }
 
-  if (
-    event.type !== 'checkout.session.completed' &&
-    event.type !== 'payment_intent.succeeded'
-  ) {
+  if (event.type !== 'checkout.session.completed' && event.type !== 'payment_intent.succeeded') {
     return new Response('Ignored event', { status: 200 });
   }
 
@@ -86,8 +78,8 @@ export async function POST(request: Request) {
   });
 
   if (error) {
-    return new Response('Webhook handled', { status: 200 });
+    log('warn', 'Stripe webhook process_stripe_payment RPC failed', { route: '/api/stripe/webhook', provider_reference: event.id });
   }
 
   return new Response('Webhook handled', { status: 200 });
-}
+});

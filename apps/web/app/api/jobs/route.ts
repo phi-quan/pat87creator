@@ -1,4 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
+import { getRequiredEnv } from '@pat87creator/config/env';
+import { log } from '@pat87creator/logger';
+import { withSafeApiHandler } from '../_lib/safeHandler';
 
 type JobStatus = 'queued' | 'processing' | 'completed' | 'failed';
 
@@ -37,16 +40,9 @@ const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 100;
 const DEFAULT_ARTIFACT_BUCKET = 'videos';
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+const supabaseUrl = getRequiredEnv('NEXT_PUBLIC_SUPABASE_URL');
+const supabaseAnonKey = getRequiredEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY');
 const artifactBucket = process.env.SUPABASE_ARTIFACT_BUCKET ?? DEFAULT_ARTIFACT_BUCKET;
-
-function missingEnvResponse(name: string) {
-  return Response.json(
-    { error: `Missing required environment variable: ${name}` },
-    { status: 500 }
-  );
-}
 
 function getBearerToken(request: Request): string | null {
   const authorizationHeader = request.headers.get('authorization');
@@ -164,15 +160,7 @@ function toVideoUrl(client: StoragePublicUrlClient, job: JobRow): string | null 
   return data.publicUrl ?? null;
 }
 
-export async function GET(request: Request) {
-  if (!supabaseUrl) {
-    return missingEnvResponse('NEXT_PUBLIC_SUPABASE_URL');
-  }
-
-  if (!supabaseAnonKey) {
-    return missingEnvResponse('NEXT_PUBLIC_SUPABASE_ANON_KEY');
-  }
-
+export const GET = withSafeApiHandler('/api/jobs', async (request: Request) => {
   const accessToken = getBearerToken(request);
   if (!accessToken) {
     return Response.json({ error: 'Unauthorized' }, { status: 401 });
@@ -227,10 +215,7 @@ export async function GET(request: Request) {
   const { data, count, error } = await query.returns<(JobRow & { videos: { user_id: string } })[]>();
 
   if (error) {
-    console.error('Failed to fetch jobs', {
-      userId: user.id,
-      message: error.message
-    });
+    log('error', 'Failed to fetch jobs', { route: '/api/jobs', user_id: user.id, error: error.message });
 
     return Response.json({ error: 'Failed to fetch jobs' }, { status: 500 });
   }
@@ -257,4 +242,4 @@ export async function GET(request: Request) {
   };
 
   return Response.json(payload, { status: 200 });
-}
+});

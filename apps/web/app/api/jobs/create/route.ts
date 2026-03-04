@@ -1,4 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
+import { getRequiredEnv } from '@pat87creator/config/env';
+import { log } from '@pat87creator/logger';
+import { withSafeApiHandler } from '../../_lib/safeHandler';
 
 type CreateJobRequest = {
   payload?: unknown;
@@ -34,16 +37,9 @@ type RuntimeWithQueue = typeof globalThis & {
 const VIDEO_JOB_COST = 10;
 const RATE_LIMIT_PREFIX = 'RATE_LIMIT_EXCEEDED|';
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-function missingEnvResponse(name: string) {
-  return Response.json(
-    { error: `Missing required environment variable: ${name}` },
-    { status: 500 }
-  );
-}
+const supabaseUrl = getRequiredEnv('NEXT_PUBLIC_SUPABASE_URL');
+const supabaseAnonKey = getRequiredEnv('NEXT_PUBLIC_SUPABASE_ANON_KEY');
+const supabaseServiceRoleKey = getRequiredEnv('SUPABASE_SERVICE_ROLE_KEY');
 
 function getBearerToken(request: Request): string | null {
   const authorizationHeader = request.headers.get('authorization');
@@ -68,17 +64,16 @@ function enqueueJob(message: JobQueueMessage): void {
   const queue = getQueueBinding();
 
   if (!queue) {
-    console.error('Queue binding VIDEO_JOB_QUEUE is not available', {
-      jobId: message.job_id
-    });
+    log('error', 'Queue binding unavailable', { route: '/api/jobs/create', job_id: message.job_id });
     return;
   }
 
   void queue.send(message).catch((error: unknown) => {
-    console.error('Failed to enqueue video job', {
-      jobId: message.job_id,
-      userId: message.user_id,
-      message: error instanceof Error ? error.message : 'Unknown error'
+    log('error', 'Failed to enqueue video job', {
+      route: '/api/jobs/create',
+      job_id: message.job_id,
+      user_id: message.user_id,
+      error: error instanceof Error ? error.message : 'unknown_error'
     });
   });
 }
@@ -90,11 +85,7 @@ function parseRateLimitError(message: string | undefined): RateLimitErrorRespons
 
   const [, code, userMessage] = message.split('|');
 
-  if (
-    code !== 'jobs_per_minute' &&
-    code !== 'concurrent_jobs' &&
-    code !== 'daily_credits'
-  ) {
+  if (code !== 'jobs_per_minute' && code !== 'concurrent_jobs' && code !== 'daily_credits') {
     return null;
   }
 
@@ -105,19 +96,7 @@ function parseRateLimitError(message: string | undefined): RateLimitErrorRespons
   };
 }
 
-export async function POST(request: Request) {
-  if (!supabaseUrl) {
-    return missingEnvResponse('NEXT_PUBLIC_SUPABASE_URL');
-  }
-
-  if (!supabaseAnonKey) {
-    return missingEnvResponse('NEXT_PUBLIC_SUPABASE_ANON_KEY');
-  }
-
-  if (!supabaseServiceRoleKey) {
-    return missingEnvResponse('SUPABASE_SERVICE_ROLE_KEY');
-  }
-
+export const POST = withSafeApiHandler('/api/jobs/create', async (request: Request) => {
   const accessToken = getBearerToken(request);
   if (!accessToken) {
     return Response.json({ error: 'Unauthorized' }, { status: 401 });
@@ -170,9 +149,10 @@ export async function POST(request: Request) {
   })) as CreateJobRpcResponse;
 
   if (rpcResponse.error || !rpcResponse.data) {
-    console.error('create_video_job RPC failed', {
-      userId: user.id,
-      message: rpcResponse.error?.message
+    log('warn', 'create_video_job RPC failed', {
+      route: '/api/jobs/create',
+      user_id: user.id,
+      error: rpcResponse.error?.message ?? 'unknown_error'
     });
 
     const rateLimitError = parseRateLimitError(rpcResponse.error?.message);
@@ -199,4 +179,4 @@ export async function POST(request: Request) {
   });
 
   return Response.json({ job_id: jobId }, { status: 200 });
-}
+});

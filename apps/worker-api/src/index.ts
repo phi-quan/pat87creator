@@ -1,10 +1,14 @@
 import { createClient } from '@supabase/supabase-js';
+import { getRequiredEnv } from '@pat87creator/config/env';
+import { log } from '@pat87creator/logger';
 
 type JobStatus = 'queued' | 'processing' | 'completed' | 'failed';
 
 type Env = {
   NEXT_PUBLIC_SUPABASE_URL?: string;
   SUPABASE_SERVICE_ROLE_KEY?: string;
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
   ADMIN_SECRET?: string;
   VIDEO_JOB_QUEUE?: Queue;
 };
@@ -49,27 +53,6 @@ function json(data: JsonRecord, status = 200): Response {
   });
 }
 
-function log(level: 'info' | 'warn' | 'error', message: string, context: JsonRecord = {}): void {
-  const record = {
-    level,
-    message,
-    ...context
-  };
-
-  const serialized = JSON.stringify(record);
-  if (level === 'error') {
-    console.error(serialized);
-    return;
-  }
-
-  if (level === 'warn') {
-    console.warn(serialized);
-    return;
-  }
-
-  console.log(serialized);
-}
-
 function parsePositiveInt(value: string | null, fallback: number): number {
   if (!value) {
     return fallback;
@@ -92,11 +75,10 @@ function parseStatus(value: string | null): JobStatus | null {
 }
 
 function createServiceClient(env: Env) {
-  if (!env.NEXT_PUBLIC_SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY) {
-    throw new Error('Missing Supabase service configuration');
-  }
+  const supabaseUrl = env.NEXT_PUBLIC_SUPABASE_URL ?? getRequiredEnv('NEXT_PUBLIC_SUPABASE_URL');
+  const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY ?? getRequiredEnv('SUPABASE_SERVICE_ROLE_KEY');
 
-  return createClient(env.NEXT_PUBLIC_SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
+  return createClient(supabaseUrl, serviceRoleKey, {
     auth: {
       persistSession: false,
       autoRefreshToken: false
@@ -110,7 +92,7 @@ function authorizeAdmin(request: Request, env: Env): Response | null {
 
   if (!secret || !received || received !== secret) {
     log('warn', 'Unauthorized admin access attempt', {
-      path: new URL(request.url).pathname
+      route: new URL(request.url).pathname
     });
     return json({ error: 'Unauthorized' }, 401);
   }
@@ -158,16 +140,11 @@ async function handleAdminJobs(request: Request, env: Env): Promise<Response> {
   const { data, count, error } = await query.returns<AdminJobRow[]>();
 
   if (error) {
-    log('error', 'Failed to fetch admin jobs', { error: error.message });
-    return json({ error: 'Failed to fetch jobs' }, 500);
+    log('error', 'Failed to fetch admin jobs', { route: '/api/admin/jobs', error: error.message });
+    return json({ error: 'internal_server_error' }, 500);
   }
 
-  return json({
-    total: count ?? 0,
-    page,
-    limit,
-    data: data ?? []
-  });
+  return json({ total: count ?? 0, page, limit, data: data ?? [] });
 }
 
 async function handleAdminMetrics(request: Request, env: Env): Promise<Response> {
@@ -180,8 +157,8 @@ async function handleAdminMetrics(request: Request, env: Env): Promise<Response>
   const { data, error } = await client.from('admin_job_metrics').select('*').single<MetricsRow>();
 
   if (error) {
-    log('error', 'Failed to fetch admin metrics', { error: error.message });
-    return json({ error: 'Failed to fetch metrics' }, 500);
+    log('error', 'Failed to fetch admin metrics', { route: '/api/admin/metrics', error: error.message });
+    return json({ error: 'internal_server_error' }, 500);
   }
 
   return json({
@@ -200,48 +177,49 @@ async function handleAdminMetrics(request: Request, env: Env): Promise<Response>
 }
 
 async function handleHealth(env: Env): Promise<Response> {
-  if (!env.NEXT_PUBLIC_SUPABASE_URL || !env.SUPABASE_SERVICE_ROLE_KEY || !env.ADMIN_SECRET) {
-    return json({ status: 'error', error: 'Missing required environment variables' }, 500);
+  const db = Boolean(env.NEXT_PUBLIC_SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY);
+  const queue = Boolean(env.VIDEO_JOB_QUEUE);
+  const stripe = Boolean(env.STRIPE_SECRET_KEY && env.STRIPE_WEBHOOK_SECRET);
+
+  if (!db || !queue || !stripe || !env.ADMIN_SECRET) {
+    return json({ status: 'error', db, queue, stripe }, 500);
   }
 
-  if (!env.VIDEO_JOB_QUEUE) {
-    return json({ status: 'error', error: 'Queue binding not configured' }, 500);
+  const client = createServiceClient(env);
+  const { error } = await client.from('jobs').select('id').limit(1);
+
+  if (error) {
+    log('error', 'Health check database query failed', { route: '/api/health', error: error.message });
+    return json({ status: 'error', db: false, queue, stripe }, 500);
   }
 
-  try {
-    const client = createServiceClient(env);
-    const { error } = await client.from('jobs').select('id').limit(1);
-
-    if (error) {
-      log('error', 'Health check database query failed', { error: error.message });
-      return json({ status: 'error', error: 'Database unavailable' }, 500);
-    }
-
-    return json({ status: 'ok' });
-  } catch (error) {
-    log('error', 'Health check failed', {
-      error: error instanceof Error ? error.message : 'Unknown health error'
-    });
-    return json({ status: 'error', error: 'Health check failure' }, 500);
-  }
+  return json({ status: 'ok', db: true, queue: true, stripe: true });
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const { pathname } = new URL(request.url);
+    try {
+      const { pathname } = new URL(request.url);
 
-    if (request.method === 'GET' && pathname === '/api/admin/jobs') {
-      return handleAdminJobs(request, env);
+      if (request.method === 'GET' && pathname === '/api/admin/jobs') {
+        return await handleAdminJobs(request, env);
+      }
+
+      if (request.method === 'GET' && pathname === '/api/admin/metrics') {
+        return await handleAdminMetrics(request, env);
+      }
+
+      if (request.method === 'GET' && pathname === '/api/health') {
+        return await handleHealth(env);
+      }
+
+      return json({ error: 'Not found' }, 404);
+    } catch (error) {
+      log('error', 'Unhandled worker-api error', {
+        route: new URL(request.url).pathname,
+        error: error instanceof Error ? error.message : 'unknown_error'
+      });
+      return json({ error: 'internal_server_error' }, 500);
     }
-
-    if (request.method === 'GET' && pathname === '/api/admin/metrics') {
-      return handleAdminMetrics(request, env);
-    }
-
-    if (request.method === 'GET' && pathname === '/api/health') {
-      return handleHealth(env);
-    }
-
-    return json({ error: 'Not found' }, 404);
   }
 } satisfies ExportedHandler<Env>;
