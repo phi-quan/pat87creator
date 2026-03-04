@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import { dispatchAlert } from '@pat87creator/alerts/dispatcher';
 import { log } from '@pat87creator/logger';
 
 type JobStatus = 'queued' | 'processing' | 'completed' | 'failed';
@@ -40,6 +41,8 @@ type Env = {
   NEXT_PUBLIC_SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
   SUPABASE_ARTIFACT_BUCKET?: string;
+  ALERT_SLACK_WEBHOOK_URL?: string;
+  ALERT_EMAIL_TO?: string;
 };
 
 const MAX_RETRIES = 3;
@@ -50,8 +53,28 @@ const CREDIT_PRICE_USD = 0.01;
 
 if ('addEventListener' in globalThis) {
   globalThis.addEventListener('unhandledrejection', (event) => {
+    const errorMessage = event.reason instanceof Error ? event.reason.message : 'unknown_reason';
+
     log('error', 'Unhandled promise rejection in worker-consumer', {
-      reason: event.reason instanceof Error ? event.reason.message : 'unknown_reason'
+      reason: errorMessage
+    });
+
+    void dispatchAlert(
+      {
+        severity: 'warning',
+        service: 'worker',
+        event: 'worker_error',
+        message: 'Worker Processing Failure',
+        metadata: {
+          error_message: errorMessage,
+          worker_context: 'worker-consumer:unhandledrejection'
+        }
+      },
+      globalThis as Env
+    ).catch((error) => {
+      log('error', 'Failed to dispatch unhandled rejection alert', {
+        error: error instanceof Error ? error.message : 'unknown_alert_error'
+      });
     });
   });
 }
@@ -240,6 +263,25 @@ async function finalizeJobEconomics(env: Env, jobId: string, executionDurationMs
     revenue_usd: result?.revenue_usd ?? null,
     margin_usd: result?.margin_usd ?? null
   });
+
+  if ((result?.margin_usd ?? 0) < 0) {
+    await dispatchAlert(
+      {
+        severity: 'warning',
+        service: 'worker',
+        event: 'margin_anomaly',
+        message: 'Negative Margin Job Detected',
+        metadata: {
+          job_id: jobId,
+          cost: result?.total_cost_usd ?? null,
+          revenue: result?.revenue_usd ?? null,
+          margin: result?.margin_usd ?? null,
+          source: 'worker-consumer'
+        }
+      },
+      env
+    );
+  }
 }
 
 async function simulateProcessing(): Promise<void> {
@@ -425,6 +467,23 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
       error: errorMessage
     });
 
+    await dispatchAlert(
+      {
+        severity: 'warning',
+        service: 'worker',
+        event: 'worker_error',
+        message: 'Worker Processing Failure',
+        metadata: {
+          job_id: body.job_id,
+          user_id: body.user_id,
+          attempt_count: started.attemptCount,
+          error_message: errorMessage,
+          worker_context: 'worker-consumer:processMessage'
+        }
+      },
+      env
+    );
+
     try {
       await updateFinalStatus(
         env,
@@ -442,6 +501,23 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
           attempt_count: started.attemptCount,
           transition: 'processing -> failed'
         });
+
+        await dispatchAlert(
+          {
+            severity: 'critical',
+            service: 'worker',
+            event: 'dead_letter',
+            message: 'Dead Letter Job Detected',
+            metadata: {
+              job_id: body.job_id,
+              user_id: body.user_id,
+              attempt_count: started.attemptCount,
+              error_message: errorMessage,
+              source: 'worker-consumer'
+            }
+          },
+          env
+        );
       }
     } catch (finalizeError) {
       log('error', 'Failed to finalize job status after processing error', {

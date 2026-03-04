@@ -9,6 +9,7 @@
     "wrangler": "3.72.0"
   },
   "dependencies": {
-    "@pat87creator/logger": "0.1.0"
+    "@pat87creator/logger": "0.1.0",
+    "@pat87creator/alerts": "0.1.0"
   }
 }

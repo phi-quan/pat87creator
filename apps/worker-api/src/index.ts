@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import { dispatchAlert } from '@pat87creator/alerts/dispatcher';
 import { getRequiredEnv } from '@pat87creator/config/env';
 import { log } from '@pat87creator/logger';
 
@@ -11,6 +12,8 @@ type Env = {
   STRIPE_WEBHOOK_SECRET?: string;
   ADMIN_SECRET?: string;
   VIDEO_JOB_QUEUE?: Queue;
+  ALERT_SLACK_WEBHOOK_URL?: string;
+  ALERT_EMAIL_TO?: string;
 };
 
 type JsonRecord = Record<string, unknown>;
@@ -182,6 +185,30 @@ async function handleHealth(env: Env): Promise<Response> {
   const stripe = Boolean(env.STRIPE_SECRET_KEY && env.STRIPE_WEBHOOK_SECRET);
 
   if (!db || !queue || !stripe || !env.ADMIN_SECRET) {
+    const failingComponents = [
+      !db ? 'db_config' : null,
+      !queue ? 'queue_binding' : null,
+      !stripe ? 'stripe_config' : null,
+      !env.ADMIN_SECRET ? 'admin_secret' : null
+    ].filter(Boolean);
+
+    await dispatchAlert(
+      {
+        severity: 'critical',
+        service: 'system',
+        event: 'health_failure',
+        message: 'System Health Failure',
+        metadata: {
+          route: '/api/health',
+          failing_components: failingComponents.join(','),
+          db,
+          queue,
+          stripe
+        }
+      },
+      env
+    );
+
     return json({ status: 'error', db, queue, stripe }, 500);
   }
 
@@ -190,6 +217,22 @@ async function handleHealth(env: Env): Promise<Response> {
 
   if (error) {
     log('error', 'Health check database query failed', { route: '/api/health', error: error.message });
+
+    await dispatchAlert(
+      {
+        severity: 'critical',
+        service: 'system',
+        event: 'health_failure',
+        message: 'System Health Failure',
+        metadata: {
+          route: '/api/health',
+          failing_component: 'db_query',
+          error_message: error.message
+        }
+      },
+      env
+    );
+
     return json({ status: 'error', db: false, queue, stripe }, 500);
   }
 
@@ -215,10 +258,27 @@ export default {
 
       return json({ error: 'Not found' }, 404);
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'unknown_error';
+
       log('error', 'Unhandled worker-api error', {
         route: new URL(request.url).pathname,
-        error: error instanceof Error ? error.message : 'unknown_error'
+        error: errorMessage
       });
+
+      await dispatchAlert(
+        {
+          severity: 'warning',
+          service: 'api',
+          event: 'worker_error',
+          message: 'Worker API Unhandled Failure',
+          metadata: {
+            route: new URL(request.url).pathname,
+            error_message: errorMessage
+          }
+        },
+        env
+      );
+
       return json({ error: 'internal_server_error' }, 500);
     }
   }
