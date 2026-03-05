@@ -7,6 +7,11 @@ type CreateJobRequest = {
   payload?: unknown;
 };
 
+type ParsedCreatePayload = {
+  prompt: string;
+  video_type: string;
+};
+
 type CreateJobRpcResponse = {
   data: string | null;
   error: { message: string } | null;
@@ -23,7 +28,9 @@ type RateLimitErrorResponse = {
 type JobQueueMessage = {
   job_id: string;
   user_id: string;
-  payload: Record<string, unknown>;
+  prompt: string;
+  video_type: string;
+  created_at: string;
 };
 
 type QueueBinding = {
@@ -54,6 +61,24 @@ function isJsonObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function parseCreatePayload(payload: unknown): ParsedCreatePayload | null {
+  if (!isJsonObject(payload) || typeof payload.prompt !== 'string') {
+    return null;
+  }
+
+  const prompt = payload.prompt.trim();
+  if (!prompt) {
+    return null;
+  }
+
+  const videoType = typeof payload.video_type === 'string' && payload.video_type.trim() ? payload.video_type : 'short';
+
+  return {
+    prompt,
+    video_type: videoType
+  };
+}
+
 function getQueueBinding(): QueueBinding | null {
   const runtime = globalThis as RuntimeWithQueue;
 
@@ -76,6 +101,37 @@ function enqueueJob(message: JobQueueMessage): void {
       error: error instanceof Error ? error.message : 'unknown_error'
     });
   });
+}
+
+async function publishJobToQueueApi(message: JobQueueMessage): Promise<void> {
+  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+  const queueId = process.env.CLOUDFLARE_QUEUE_ID;
+  const apiToken = process.env.CLOUDFLARE_API_TOKEN;
+
+  if (!accountId || !queueId || !apiToken) {
+    log('warn', 'Cloudflare queue API credentials are missing; queue publish skipped', {
+      route: '/api/jobs/create',
+      job_id: message.job_id
+    });
+    return;
+  }
+
+  const response = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${accountId}/queues/${queueId}/messages`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ body: message })
+    }
+  );
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Cloudflare queue publish failed: ${response.status} ${body}`);
+  }
 }
 
 function parseRateLimitError(message: string | undefined): RateLimitErrorResponse | null {
@@ -131,7 +187,9 @@ export const POST = withSafeApiHandler('/api/jobs/create', async (request: Reque
     return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
-  if (!isJsonObject(requestBody.payload)) {
+  const parsedPayload = parseCreatePayload(requestBody.payload);
+
+  if (!parsedPayload) {
     return Response.json({ error: 'Invalid payload' }, { status: 400 });
   }
 
@@ -142,10 +200,37 @@ export const POST = withSafeApiHandler('/api/jobs/create', async (request: Reque
     }
   });
 
+  const { data: videoRow, error: videoError } = await serviceClient
+    .from('videos')
+    .insert({
+      user_id: user.id,
+      source_url: 'pending://render',
+      status: 'queued'
+    })
+    .select('id')
+    .single<{ id: string }>();
+
+  if (videoError || !videoRow?.id) {
+    log('error', 'Unable to create video row for job', {
+      route: '/api/jobs/create',
+      user_id: user.id,
+      error: videoError?.message ?? 'unknown_error'
+    });
+
+    return Response.json({ error: 'Unable to create job' }, { status: 500 });
+  }
+
+  const requestTimestamp = new Date().toISOString();
+
   const rpcResponse = (await serviceClient.rpc('create_video_job', {
     p_user_id: user.id,
     p_cost: VIDEO_JOB_COST,
-    p_payload: requestBody.payload
+    p_payload: {
+      video_id: videoRow.id,
+      prompt: parsedPayload.prompt,
+      video_type: parsedPayload.video_type,
+      created_at: requestTimestamp
+    }
   })) as CreateJobRpcResponse;
 
   if (rpcResponse.error || !rpcResponse.data) {
@@ -171,12 +256,23 @@ export const POST = withSafeApiHandler('/api/jobs/create', async (request: Reque
   }
 
   const jobId = rpcResponse.data;
-
-  enqueueJob({
+  const queueMessage: JobQueueMessage = {
     job_id: jobId,
     user_id: user.id,
-    payload: requestBody.payload
+    prompt: parsedPayload.prompt,
+    video_type: parsedPayload.video_type,
+    created_at: requestTimestamp
+  };
+
+  enqueueJob(queueMessage);
+  void publishJobToQueueApi(queueMessage).catch((error: unknown) => {
+    log('error', 'Failed to publish job via Cloudflare queue API', {
+      route: '/api/jobs/create',
+      job_id: jobId,
+      user_id: user.id,
+      error: error instanceof Error ? error.message : 'unknown_error'
+    });
   });
 
-  return Response.json({ job_id: jobId }, { status: 200 });
+  return Response.json({ job_id: jobId, status: 'pending' }, { status: 200 });
 });

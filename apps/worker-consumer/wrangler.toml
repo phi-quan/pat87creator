@@ -10,3 +10,4 @@ max_batch_timeout = 5
 [vars]
 # Populate per-environment via wrangler secret/vars.
 NEXT_PUBLIC_SUPABASE_URL = ""
+N8N_RENDER_WEBHOOK_URL = ""
