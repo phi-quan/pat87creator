@@ -43,3 +43,18 @@ Run web app locally:
 ```bash
 npm run dev:web
 ```
+
+
+## Cloudflare Pages configuration
+
+For production deployment of the web app, configure Cloudflare Pages with:
+
+- Root directory: `apps/web`
+- Build command: `npm run build`
+- Output directory: `.next`
+
+Required environment variables in Cloudflare Pages:
+
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+
