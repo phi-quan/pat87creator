@@ -7,7 +7,9 @@ type JobStatus = 'queued' | 'processing' | 'completed' | 'failed';
 type JobQueueMessage = {
   job_id: string;
   user_id: string;
-  payload: Record<string, unknown>;
+  prompt: string;
+  video_type: string;
+  created_at: string;
 };
 
 type JobResultPayload = {
@@ -17,6 +19,7 @@ type JobResultPayload = {
 
 type JobRow = {
   id: string;
+  video_id: string;
   status: JobStatus;
   attempt_count: number;
   locked_at: string | null;
@@ -37,6 +40,12 @@ type StartedJob = {
   processingStartedAt: string;
 };
 
+type RenderPipelineResponse = {
+  storage_url?: string;
+  artifact_path?: string;
+  duration?: number;
+};
+
 type Env = {
   NEXT_PUBLIC_SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
@@ -44,6 +53,8 @@ type Env = {
   ALERT_SLACK_WEBHOOK_URL?: string;
   ALERT_EMAIL_TO?: string;
   WORKER_CONCURRENCY?: string;
+  N8N_RENDER_WEBHOOK_URL?: string;
+  N8N_WEBHOOK_AUTH_TOKEN?: string;
 };
 
 const MAX_RETRIES = 3;
@@ -52,34 +63,6 @@ const DEFAULT_ARTIFACT_BUCKET = 'videos';
 const COMPUTE_COST_PER_SECOND_USD = 0.0004;
 const CREDIT_PRICE_USD = 0.01;
 const DEFAULT_WORKER_CONCURRENCY = 5;
-
-if ('addEventListener' in globalThis) {
-  globalThis.addEventListener('unhandledrejection', (event) => {
-    const errorMessage = event.reason instanceof Error ? event.reason.message : 'unknown_reason';
-
-    log('error', 'Unhandled promise rejection in worker-consumer', {
-      reason: errorMessage
-    });
-
-    void dispatchAlert(
-      {
-        severity: 'warning',
-        service: 'worker',
-        event: 'worker_error',
-        message: 'Worker Processing Failure',
-        metadata: {
-          error_message: errorMessage,
-          worker_context: 'worker-consumer:unhandledrejection'
-        }
-      },
-      globalThis as Env
-    ).catch((error) => {
-      log('error', 'Failed to dispatch unhandled rejection alert', {
-        error: error instanceof Error ? error.message : 'unknown_alert_error'
-      });
-    });
-  });
-}
 
 function createServiceClient(env: Env) {
   return createClient(env.NEXT_PUBLIC_SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, {
@@ -110,7 +93,7 @@ function getWorkerConcurrency(env: Env): number {
 async function fetchJob(client: SupabaseClient, jobId: string): Promise<JobRow | null> {
   const { data, error } = await client
     .from('jobs')
-    .select('id, status, attempt_count, locked_at, processing_token, result_payload, processing_started_at')
+    .select('id, video_id, status, attempt_count, locked_at, processing_token, result_payload, processing_started_at')
     .eq('id', jobId)
     .maybeSingle<JobRow>();
 
@@ -151,6 +134,8 @@ async function startProcessing(client: SupabaseClient, job: JobRow): Promise<Sta
     throw new Error('Unable to claim job for processing due to concurrent update');
   }
 
+  await client.from('videos').update({ status: 'processing' }).eq('id', job.video_id);
+
   return {
     attemptCount: data.attempt_count,
     processingToken: data.processing_token,
@@ -190,6 +175,29 @@ async function persistResultPayload(
 
   if (error) {
     throw new Error(`Unable to persist result payload: ${error.message}`);
+  }
+}
+
+async function updateVideoMetadata(
+  client: SupabaseClient,
+  videoId: string,
+  status: 'processing' | 'completed' | 'failed',
+  storageUrl?: string,
+  duration?: number
+): Promise<void> {
+  const payload: Record<string, unknown> = { status };
+  if (storageUrl) {
+    payload.storage_url = storageUrl;
+    payload.source_url = storageUrl;
+  }
+  if (typeof duration === 'number') {
+    payload.duration = duration;
+  }
+
+  const { error } = await client.from('videos').update(payload).eq('id', videoId);
+
+  if (error) {
+    throw new Error(`Unable to update video metadata: ${error.message}`);
   }
 }
 
@@ -241,7 +249,7 @@ async function updateFinalStatus(
   return durationMs;
 }
 
-async function finalizeJobEconomics(client: SupabaseClient, env: Env, jobId: string, executionDurationMs: number): Promise<void> {
+async function finalizeJobEconomics(client: SupabaseClient, jobId: string, executionDurationMs: number): Promise<void> {
   const computeCostUsd = (executionDurationMs / 1000) * COMPUTE_COST_PER_SECOND_USD;
 
   const { data, error } = await client.rpc('finalize_job_economics', {
@@ -264,29 +272,41 @@ async function finalizeJobEconomics(client: SupabaseClient, env: Env, jobId: str
     revenue_usd: result?.revenue_usd ?? null,
     margin_usd: result?.margin_usd ?? null
   });
-
-  if ((result?.margin_usd ?? 0) < 0) {
-    await dispatchAlert(
-      {
-        severity: 'warning',
-        service: 'worker',
-        event: 'margin_anomaly',
-        message: 'Negative Margin Job Detected',
-        metadata: {
-          job_id: jobId,
-          cost: result?.total_cost_usd ?? null,
-          revenue: result?.revenue_usd ?? null,
-          margin: result?.margin_usd ?? null,
-          source: 'worker-consumer'
-        }
-      },
-      env
-    );
-  }
 }
 
-async function simulateProcessing(): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 100));
+async function triggerRenderPipeline(message: JobQueueMessage, env: Env): Promise<RenderPipelineResponse> {
+  if (!env.N8N_RENDER_WEBHOOK_URL) {
+    return {
+      artifact_path: artifactPathForJob(message.job_id),
+      duration: 0
+    };
+  }
+
+  const headers: Record<string, string> = {
+    'content-type': 'application/json'
+  };
+
+  if (env.N8N_WEBHOOK_AUTH_TOKEN) {
+    headers.authorization = `Bearer ${env.N8N_WEBHOOK_AUTH_TOKEN}`;
+  }
+
+  const response = await fetch(env.N8N_RENDER_WEBHOOK_URL, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      job_id: message.job_id,
+      prompt: message.prompt,
+      video_type: message.video_type
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Render pipeline call failed: ${response.status}`);
+  }
+
+  const responseData = (await response.json().catch(() => ({}))) as RenderPipelineResponse;
+
+  return responseData;
 }
 
 async function processMessage(message: Message<JobQueueMessage>, env: Env, client: SupabaseClient): Promise<void> {
@@ -304,38 +324,14 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env, clien
   }
 
   if (job.status === 'completed') {
-    log('info', 'Skipping already completed job', {
-      job_id: body.job_id,
-      processing_token: job.processing_token,
-      attempt_count: job.attempt_count,
-      transition_reason: 'completed_guard',
-      skip_reason: 'already_completed',
-      transition: 'completed -> completed'
-    });
     return;
   }
 
   if (job.status === 'failed' && job.attempt_count >= MAX_RETRIES) {
-    log('info', 'Skipping dead-lettered job', {
-      job_id: body.job_id,
-      processing_token: job.processing_token,
-      attempt_count: job.attempt_count,
-      transition_reason: 'dead_letter_guard',
-      skip_reason: 'max_retries_reached',
-      transition: 'failed -> failed'
-    });
     return;
   }
 
   if (job.status === 'processing' && !isLockExpired(job.locked_at)) {
-    log('info', 'Skipping currently locked processing job', {
-      job_id: body.job_id,
-      processing_token: job.processing_token,
-      attempt_count: job.attempt_count,
-      transition_reason: 'lock_guard',
-      skip_reason: 'active_lock',
-      transition: 'processing -> processing'
-    });
     return;
   }
 
@@ -348,39 +344,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env, clien
   try {
     started = await startProcessing(client, job);
 
-    log('info', 'Transitioning job to processing', {
-      job_id: body.job_id,
-      processing_token: started.processingToken,
-      attempt_count: started.attemptCount,
-      transition_reason: 'claim_for_attempt',
-      transition: `${job.status} -> processing`
-    });
-
-    const refreshedJob = await fetchJob(client, body.job_id);
-    if (!refreshedJob) {
-      throw new Error('Job disappeared after processing transition');
-    }
-
-    if (refreshedJob.status === 'completed') {
-      log('info', 'Skipping heavy processing for completed job', {
-        job_id: body.job_id,
-        processing_token: started.processingToken,
-        attempt_count: started.attemptCount,
-        transition_reason: 'post_claim_refresh',
-        skip_reason: 'already_completed'
-      });
-      return;
-    }
-
-    if (refreshedJob.result_payload) {
-      log('info', 'Result payload already exists, finalizing job without heavy processing', {
-        job_id: body.job_id,
-        processing_token: started.processingToken,
-        attempt_count: started.attemptCount,
-        transition_reason: 'result_payload_guard',
-        skip_reason: 'result_payload_exists'
-      });
-
+    if (job.result_payload) {
       const durationMs = await updateFinalStatus(
         client,
         body.job_id,
@@ -389,7 +353,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env, clien
         started.processingToken,
         started.processingStartedAt
       );
-      await finalizeJobEconomics(client, env, body.job_id, durationMs);
+      await finalizeJobEconomics(client, body.job_id, durationMs);
       return;
     }
 
@@ -397,21 +361,12 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env, clien
     const existingArtifact = await artifactExists(client, env, artifactPath);
 
     if (existingArtifact) {
-      const payload: JobResultPayload = {
+      await persistResultPayload(client, body.job_id, started.attemptCount, started.processingToken, {
         artifact_path: artifactPath,
         source: 'existing_artifact'
-      };
-
-      log('info', 'Artifact already exists, bypassing heavy processing', {
-        job_id: body.job_id,
-        processing_token: started.processingToken,
-        attempt_count: started.attemptCount,
-        transition_reason: 'artifact_exists_guard',
-        skip_reason: 'artifact_exists',
-        artifact_path: artifactPath
       });
+      await updateVideoMetadata(client, job.video_id, 'completed', artifactPath);
 
-      await persistResultPayload(client, body.job_id, started.attemptCount, started.processingToken, payload);
       const durationMs = await updateFinalStatus(
         client,
         body.job_id,
@@ -420,18 +375,20 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env, clien
         started.processingToken,
         started.processingStartedAt
       );
-      await finalizeJobEconomics(client, env, body.job_id, durationMs);
+      await finalizeJobEconomics(client, body.job_id, durationMs);
       return;
     }
 
-    await simulateProcessing();
+    const renderResponse = await triggerRenderPipeline(body, env);
+    const storedArtifact =
+      renderResponse.storage_url ?? renderResponse.artifact_path ?? artifactPathForJob(body.job_id);
 
-    const payload: JobResultPayload = {
-      artifact_path: artifactPath,
+    await persistResultPayload(client, body.job_id, started.attemptCount, started.processingToken, {
+      artifact_path: storedArtifact,
       source: 'render'
-    };
+    });
+    await updateVideoMetadata(client, job.video_id, 'completed', storedArtifact, renderResponse.duration);
 
-    await persistResultPayload(client, body.job_id, started.attemptCount, started.processingToken, payload);
     const durationMs = await updateFinalStatus(
       client,
       body.job_id,
@@ -440,16 +397,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env, clien
       started.processingToken,
       started.processingStartedAt
     );
-    await finalizeJobEconomics(client, env, body.job_id, durationMs);
-
-    log('info', 'Transitioning job to completed', {
-      job_id: body.job_id,
-      processing_token: started.processingToken,
-      attempt_count: started.attemptCount,
-      transition_reason: 'external_work_success',
-      transition: 'processing -> completed',
-      artifact_path: artifactPath
-    });
+    await finalizeJobEconomics(client, body.job_id, durationMs);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown processing failure';
 
@@ -458,15 +406,6 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env, clien
     }
 
     const nextStatus: 'queued' | 'failed' = started.attemptCount < MAX_RETRIES ? 'queued' : 'failed';
-
-    log('error', 'Video job processing failed', {
-      job_id: body.job_id,
-      processing_token: started.processingToken,
-      attempt_count: started.attemptCount,
-      transition_reason: 'processing_error',
-      transition: `processing -> ${nextStatus}`,
-      error: errorMessage
-    });
 
     await dispatchAlert(
       {
@@ -485,47 +424,35 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env, clien
       env
     );
 
-    try {
-      await updateFinalStatus(
-        client,
-        body.job_id,
-        nextStatus,
-        started.attemptCount,
-        started.processingToken,
-        started.processingStartedAt,
-        nextStatus === 'failed' ? errorMessage : undefined
+    await updateVideoMetadata(client, job.video_id, nextStatus === 'failed' ? 'failed' : 'queued');
+
+    await updateFinalStatus(
+      client,
+      body.job_id,
+      nextStatus,
+      started.attemptCount,
+      started.processingToken,
+      started.processingStartedAt,
+      nextStatus === 'failed' ? errorMessage : undefined
+    );
+
+    if (nextStatus === 'failed') {
+      await dispatchAlert(
+        {
+          severity: 'critical',
+          service: 'worker',
+          event: 'dead_letter',
+          message: 'Dead Letter Job Detected',
+          metadata: {
+            job_id: body.job_id,
+            user_id: body.user_id,
+            attempt_count: started.attemptCount,
+            error_message: errorMessage,
+            source: 'worker-consumer'
+          }
+        },
+        env
       );
-
-      if (nextStatus === 'failed') {
-        log('warn', 'Job transitioned to dead-letter state', {
-          job_id: body.job_id,
-          attempt_count: started.attemptCount,
-          transition: 'processing -> failed'
-        });
-
-        await dispatchAlert(
-          {
-            severity: 'critical',
-            service: 'worker',
-            event: 'dead_letter',
-            message: 'Dead Letter Job Detected',
-            metadata: {
-              job_id: body.job_id,
-              user_id: body.user_id,
-              attempt_count: started.attemptCount,
-              error_message: errorMessage,
-              source: 'worker-consumer'
-            }
-          },
-          env
-        );
-      }
-    } catch (finalizeError) {
-      log('error', 'Failed to finalize job status after processing error', {
-        job_id: body.job_id,
-        error: finalizeError instanceof Error ? finalizeError.message : 'unknown_finalize_error'
-      });
-      throw finalizeError;
     }
   }
 }
