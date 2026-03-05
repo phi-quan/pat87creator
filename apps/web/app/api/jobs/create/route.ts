@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import { getRequiredEnv } from '@pat87creator/config/env';
 import { log } from '@pat87creator/logger';
+import { getVideoJobCost } from '../../../../lib/billing';
 import { withSafeApiHandler } from '../../_lib/safeHandler';
 
 type CreateJobRequest = {
@@ -41,7 +42,7 @@ type RuntimeWithQueue = typeof globalThis & {
   VIDEO_JOB_QUEUE?: QueueBinding;
 };
 
-const VIDEO_JOB_COST = 10;
+const VIDEO_JOB_COST = getVideoJobCost();
 const RATE_LIMIT_PREFIX = 'RATE_LIMIT_EXCEEDED|';
 
 const supabaseUrl = getRequiredEnv('NEXT_PUBLIC_SUPABASE_URL');
