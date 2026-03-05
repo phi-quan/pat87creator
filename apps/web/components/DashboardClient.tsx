@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { CreateVideoForm } from './CreateVideoForm';
 import { CreditBalance } from './CreditBalance';
 import { JobTable } from './JobTable';
+import { UsageMetrics } from './UsageMetrics';
 import { useToast } from './ToastProvider';
 import { supabase } from '../lib/supabase';
 
@@ -156,6 +157,7 @@ export function DashboardClient() {
 
   return (
     <>
+      <UsageMetrics refreshKey={refreshKey} />
       <CreditBalance refreshKey={refreshKey} />
       <CreateVideoForm onCreateJob={createJob} isSubmitting={isSubmitting} cooldownSeconds={cooldownSeconds} />
       <JobTable
