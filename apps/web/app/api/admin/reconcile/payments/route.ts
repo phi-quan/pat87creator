@@ -10,7 +10,8 @@ export const POST = withSafeApiHandler('/api/admin/reconcile/payments', async (r
     return Response.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const report = await buildBillingReconciliationReport();
+  const since = new URL(request.url).searchParams.get('since') ?? undefined;
+  const report = await buildBillingReconciliationReport({ since });
 
   return Response.json(report, { status: 200 });
 });

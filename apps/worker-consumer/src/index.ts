@@ -1,4 +1,4 @@
-import { createClient } from '@supabase/supabase-js';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { dispatchAlert } from '@pat87creator/alerts/dispatcher';
 import { log } from '@pat87creator/logger';
 
@@ -43,6 +43,7 @@ type Env = {
   SUPABASE_ARTIFACT_BUCKET?: string;
   ALERT_SLACK_WEBHOOK_URL?: string;
   ALERT_EMAIL_TO?: string;
+  WORKER_CONCURRENCY?: string;
 };
 
 const MAX_RETRIES = 3;
@@ -50,6 +51,7 @@ const PROCESSING_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_ARTIFACT_BUCKET = 'videos';
 const COMPUTE_COST_PER_SECOND_USD = 0.0004;
 const CREDIT_PRICE_USD = 0.01;
+const DEFAULT_WORKER_CONCURRENCY = 5;
 
 if ('addEventListener' in globalThis) {
   globalThis.addEventListener('unhandledrejection', (event) => {
@@ -100,8 +102,12 @@ function isLockExpired(lockedAt: string | null): boolean {
   return Date.now() - new Date(lockedAt).getTime() >= PROCESSING_TIMEOUT_MS;
 }
 
-async function fetchJob(env: Env, jobId: string): Promise<JobRow | null> {
-  const client = createServiceClient(env);
+function getWorkerConcurrency(env: Env): number {
+  const parsed = Number.parseInt(env.WORKER_CONCURRENCY ?? '', 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_WORKER_CONCURRENCY;
+}
+
+async function fetchJob(client: SupabaseClient, jobId: string): Promise<JobRow | null> {
   const { data, error } = await client
     .from('jobs')
     .select('id, status, attempt_count, locked_at, processing_token, result_payload, processing_started_at')
@@ -115,8 +121,7 @@ async function fetchJob(env: Env, jobId: string): Promise<JobRow | null> {
   return data;
 }
 
-async function startProcessing(env: Env, job: JobRow): Promise<StartedJob> {
-  const client = createServiceClient(env);
+async function startProcessing(client: SupabaseClient, job: JobRow): Promise<StartedJob> {
   const nextAttemptCount = job.attempt_count + 1;
   const nowIso = new Date().toISOString();
   const processingToken = crypto.randomUUID();
@@ -153,8 +158,7 @@ async function startProcessing(env: Env, job: JobRow): Promise<StartedJob> {
   };
 }
 
-async function artifactExists(env: Env, artifactPath: string): Promise<boolean> {
-  const client = createServiceClient(env);
+async function artifactExists(client: SupabaseClient, env: Env, artifactPath: string): Promise<boolean> {
   const bucket = env.SUPABASE_ARTIFACT_BUCKET || DEFAULT_ARTIFACT_BUCKET;
 
   const { data, error } = await client.storage.from(bucket).list('', {
@@ -170,13 +174,12 @@ async function artifactExists(env: Env, artifactPath: string): Promise<boolean> 
 }
 
 async function persistResultPayload(
-  env: Env,
+  client: SupabaseClient,
   jobId: string,
   attemptCount: number,
   processingToken: string,
   payload: JobResultPayload
 ): Promise<void> {
-  const client = createServiceClient(env);
   const { error } = await client
     .from('jobs')
     .update({ result_payload: payload })
@@ -191,7 +194,7 @@ async function persistResultPayload(
 }
 
 async function updateFinalStatus(
-  env: Env,
+  client: SupabaseClient,
   jobId: string,
   status: 'queued' | 'completed' | 'failed',
   attemptCount: number,
@@ -199,7 +202,6 @@ async function updateFinalStatus(
   processingStartedAt: string,
   errorMessage?: string
 ): Promise<number> {
-  const client = createServiceClient(env);
   const payload: {
     status: 'queued' | 'completed' | 'failed';
     locked_at: null;
@@ -239,8 +241,7 @@ async function updateFinalStatus(
   return durationMs;
 }
 
-async function finalizeJobEconomics(env: Env, jobId: string, executionDurationMs: number): Promise<void> {
-  const client = createServiceClient(env);
+async function finalizeJobEconomics(client: SupabaseClient, env: Env, jobId: string, executionDurationMs: number): Promise<void> {
   const computeCostUsd = (executionDurationMs / 1000) * COMPUTE_COST_PER_SECOND_USD;
 
   const { data, error } = await client.rpc('finalize_job_economics', {
@@ -288,14 +289,14 @@ async function simulateProcessing(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 100));
 }
 
-async function processMessage(message: Message<JobQueueMessage>, env: Env): Promise<void> {
+async function processMessage(message: Message<JobQueueMessage>, env: Env, client: SupabaseClient): Promise<void> {
   const body = message.body;
 
   if (!body?.job_id) {
     throw new Error('Queue message missing job_id');
   }
 
-  const job = await fetchJob(env, body.job_id);
+  const job = await fetchJob(client, body.job_id);
 
   if (!job) {
     log('error', 'Job not found for queued message', { job_id: body.job_id, transition_reason: 'missing_job' });
@@ -345,7 +346,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
   let started: StartedJob | null = null;
 
   try {
-    started = await startProcessing(env, job);
+    started = await startProcessing(client, job);
 
     log('info', 'Transitioning job to processing', {
       job_id: body.job_id,
@@ -355,7 +356,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
       transition: `${job.status} -> processing`
     });
 
-    const refreshedJob = await fetchJob(env, body.job_id);
+    const refreshedJob = await fetchJob(client, body.job_id);
     if (!refreshedJob) {
       throw new Error('Job disappeared after processing transition');
     }
@@ -381,19 +382,19 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
       });
 
       const durationMs = await updateFinalStatus(
-        env,
+        client,
         body.job_id,
         'completed',
         started.attemptCount,
         started.processingToken,
         started.processingStartedAt
       );
-      await finalizeJobEconomics(env, body.job_id, durationMs);
+      await finalizeJobEconomics(client, env, body.job_id, durationMs);
       return;
     }
 
     const artifactPath = artifactPathForJob(body.job_id);
-    const existingArtifact = await artifactExists(env, artifactPath);
+    const existingArtifact = await artifactExists(client, env, artifactPath);
 
     if (existingArtifact) {
       const payload: JobResultPayload = {
@@ -410,16 +411,16 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
         artifact_path: artifactPath
       });
 
-      await persistResultPayload(env, body.job_id, started.attemptCount, started.processingToken, payload);
+      await persistResultPayload(client, body.job_id, started.attemptCount, started.processingToken, payload);
       const durationMs = await updateFinalStatus(
-        env,
+        client,
         body.job_id,
         'completed',
         started.attemptCount,
         started.processingToken,
         started.processingStartedAt
       );
-      await finalizeJobEconomics(env, body.job_id, durationMs);
+      await finalizeJobEconomics(client, env, body.job_id, durationMs);
       return;
     }
 
@@ -430,16 +431,16 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
       source: 'render'
     };
 
-    await persistResultPayload(env, body.job_id, started.attemptCount, started.processingToken, payload);
+    await persistResultPayload(client, body.job_id, started.attemptCount, started.processingToken, payload);
     const durationMs = await updateFinalStatus(
-      env,
+      client,
       body.job_id,
       'completed',
       started.attemptCount,
       started.processingToken,
       started.processingStartedAt
     );
-    await finalizeJobEconomics(env, body.job_id, durationMs);
+    await finalizeJobEconomics(client, env, body.job_id, durationMs);
 
     log('info', 'Transitioning job to completed', {
       job_id: body.job_id,
@@ -486,7 +487,7 @@ async function processMessage(message: Message<JobQueueMessage>, env: Env): Prom
 
     try {
       await updateFinalStatus(
-        env,
+        client,
         body.job_id,
         nextStatus,
         started.attemptCount,
@@ -536,16 +537,25 @@ export default {
       return;
     }
 
-    for (const message of batch.messages) {
-      try {
-        await processMessage(message, env);
-        message.ack();
-      } catch (error) {
-        log('error', 'Unhandled queue message error', {
-          message: error instanceof Error ? error.message : 'Unknown error'
-        });
-        message.retry();
-      }
+    const client = createServiceClient(env);
+    const concurrency = getWorkerConcurrency(env);
+
+    for (let index = 0; index < batch.messages.length; index += concurrency) {
+      const chunk = batch.messages.slice(index, index + concurrency);
+
+      await Promise.all(
+        chunk.map(async (message) => {
+          try {
+            await processMessage(message, env, client);
+            message.ack();
+          } catch (error) {
+            log('error', 'Unhandled queue message error', {
+              message: error instanceof Error ? error.message : 'Unknown error'
+            });
+            message.retry();
+          }
+        })
+      );
     }
   }
 };

@@ -23,6 +23,11 @@ type MonitoringResponse = {
   revenue_today_usd: number;
   cost_today_usd: number;
   margin_today_usd: number;
+  jobs_per_minute: number;
+  queue_backlog_size: number;
+  queue_backlog_threshold: number;
+  worker_concurrency: number;
+  worker_utilization: number;
   billing_integrity: {
     payments_verified: number;
     credit_mismatches: number;
@@ -31,6 +36,7 @@ type MonitoringResponse = {
     negative_margin_jobs: number;
     credits_verified: boolean;
     last_reconciled_at: string;
+    since: string;
   };
   system_health: {
     db: boolean;
@@ -143,6 +149,7 @@ export function AdminMonitoringDashboard({ adminSecret }: { adminSecret: string 
           <StatCard title="Failed jobs" value={data.jobs_failed} />
           <StatCard title="Dead-letter jobs" value={data.jobs_dead_letter} />
           <StatCard title="Queue depth" value={data.queue_depth} />
+          <StatCard title="Queue backlog" value={data.queue_backlog_size} />
           <StatCard title="Jobs last hour" value={data.jobs_last_hour} />
         </div>
       </section>
@@ -154,6 +161,8 @@ export function AdminMonitoringDashboard({ adminSecret }: { adminSecret: string 
           <StatCard title="P95 processing (ms)" value={data.p95_processing_time_ms} />
           <StatCard title="Success rate (1h)" value={`${(data.jobs_success_rate * 100).toFixed(1)}%`} />
           <StatCard title="Success rate (24h)" value={`${(data.jobs_success_rate_24h * 100).toFixed(1)}%`} />
+          <StatCard title="Jobs/minute" value={data.jobs_per_minute} />
+          <StatCard title="Worker utilization" value={`${(data.worker_utilization * 100).toFixed(1)}%`} />
         </div>
       </section>
 
@@ -187,6 +196,9 @@ export function AdminMonitoringDashboard({ adminSecret }: { adminSecret: string 
 
       <p style={{ margin: 0, color: '#6b7280', fontSize: 12 }}>
         Auto-refresh every 12 seconds. Last refreshed: {new Date(data.refreshed_at).toLocaleString()}
+      </p>
+      <p style={{ margin: 0, color: '#6b7280', fontSize: 12 }}>
+        Worker concurrency: {data.worker_concurrency}. Queue backlog threshold: {data.queue_backlog_threshold}.
       </p>
     </div>
   );

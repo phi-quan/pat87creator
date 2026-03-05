@@ -11,6 +11,7 @@ const stripe = new Stripe(stripeSecretKey, {
 });
 
 const STRIPE_SCAN_LIMIT = 500;
+const DEFAULT_RECONCILIATION_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 type PaymentRow = {
   id: string;
@@ -52,6 +53,7 @@ type ReconciliationAnomaly = {
 
 export type BillingReconciliationReport = {
   generated_at: string;
+  since: string;
   payments_checked: number;
   credits_verified: boolean;
   credit_mismatches: number;
@@ -67,6 +69,10 @@ export type BillingReconciliationReport = {
   };
 };
 
+export type ReconciliationOptions = {
+  since?: string;
+};
+
 function roundCurrency(value: number): number {
   return Number(value.toFixed(2));
 }
@@ -75,9 +81,28 @@ function centsToUsd(amountCents: number): number {
   return amountCents / 100;
 }
 
-async function fetchSucceededStripePaymentIntents(): Promise<Stripe.PaymentIntent[]> {
+function resolveSince(since?: string): string {
+  if (!since) {
+    return new Date(Date.now() - DEFAULT_RECONCILIATION_WINDOW_MS).toISOString();
+  }
+
+  const parsed = new Date(since);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new Error('Invalid since timestamp');
+  }
+
+  return parsed.toISOString();
+}
+
+async function fetchSucceededStripePaymentIntents(sinceIso: string): Promise<Stripe.PaymentIntent[]> {
   const intents: Stripe.PaymentIntent[] = [];
-  const iterator = stripe.paymentIntents.list({ limit: 100 });
+  const sinceEpochSeconds = Math.floor(new Date(sinceIso).getTime() / 1000);
+  const iterator = stripe.paymentIntents.list({
+    limit: 100,
+    created: {
+      gte: sinceEpochSeconds
+    }
+  });
 
   for await (const paymentIntent of iterator) {
     if (paymentIntent.status === 'succeeded') {
@@ -92,7 +117,9 @@ async function fetchSucceededStripePaymentIntents(): Promise<Stripe.PaymentInten
   return intents;
 }
 
-export async function buildBillingReconciliationReport(): Promise<BillingReconciliationReport> {
+export async function buildBillingReconciliationReport(options: ReconciliationOptions = {}): Promise<BillingReconciliationReport> {
+  const sinceIso = resolveSince(options.since);
+
   const supabase = createClient(supabaseUrl, serviceRoleKey, {
     auth: {
       persistSession: false,
@@ -101,15 +128,25 @@ export async function buildBillingReconciliationReport(): Promise<BillingReconci
   });
 
   const [stripePayments, paymentsResult, paymentEventsResult, jobsResult, jobCostsResult] = await Promise.all([
-    fetchSucceededStripePaymentIntents(),
-    supabase.from('payments').select('id, provider_reference, amount_cents, status').eq('status', 'succeeded').returns<PaymentRow[]>(),
+    fetchSucceededStripePaymentIntents(sinceIso),
+    supabase
+      .from('payments')
+      .select('id, provider_reference, amount_cents, status')
+      .eq('status', 'succeeded')
+      .gte('created_at', sinceIso)
+      .returns<PaymentRow[]>(),
     supabase
       .from('payment_events')
       .select('id, provider_reference, amount_cents, status')
       .eq('status', 'succeeded')
+      .gte('created_at', sinceIso)
       .returns<PaymentEventRow[]>(),
-    supabase.from('jobs').select('id, billed_credits, revenue_usd').returns<JobRow[]>(),
-    supabase.from('job_costs').select('job_id, amount_usd').returns<JobCostRow[]>()
+    supabase.from('jobs').select('id, billed_credits, revenue_usd').gte('created_at', sinceIso).returns<JobRow[]>(),
+    supabase
+      .from('job_costs')
+      .select('job_id, amount_usd')
+      .gte('created_at', sinceIso)
+      .returns<JobCostRow[]>()
   ]);
 
   if (paymentsResult.error || paymentEventsResult.error || jobsResult.error || jobCostsResult.error) {
@@ -254,6 +291,7 @@ export async function buildBillingReconciliationReport(): Promise<BillingReconci
 
   return {
     generated_at: new Date().toISOString(),
+    since: sinceIso,
     payments_checked: stripePayments.length,
     credits_verified: creditMismatches === 0,
     credit_mismatches: creditMismatches,
