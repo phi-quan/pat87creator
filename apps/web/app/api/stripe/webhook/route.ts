@@ -1,4 +1,3 @@
-export const runtime = 'edge';
 import { createClient } from '@supabase/supabase-js';
 import { dispatchAlert } from '@pat87creator/alerts/dispatcher';
 import { getRequiredEnv } from '@pat87creator/config/env';

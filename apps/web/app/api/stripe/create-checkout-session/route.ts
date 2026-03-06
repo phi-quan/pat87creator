@@ -1,4 +1,3 @@
-export const runtime = 'edge';
 import { createClient } from '@supabase/supabase-js';
 import { getRequiredEnv } from '@pat87creator/config/env';
 import { withSafeApiHandler } from '../../_lib/safeHandler';
