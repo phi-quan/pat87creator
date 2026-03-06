@@ -1,4 +1,3 @@
-export const runtime = 'edge';
 import { getRequiredEnv } from '@pat87creator/config/env';
 import { withSafeApiHandler } from '../../../_lib/safeHandler';
 import { buildBillingReconciliationReport } from '../_lib/reconciliation';

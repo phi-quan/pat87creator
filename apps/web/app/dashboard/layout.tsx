@@ -13,7 +13,8 @@ async function validateServerSession() {
     return false;
   }
 
-  const token = cookies().get(ACCESS_TOKEN_COOKIE_NAME)?.value;
+  const cookieStore = await cookies();
+  const token = cookieStore.get(ACCESS_TOKEN_COOKIE_NAME)?.value;
   if (!token) {
     return false;
   }
