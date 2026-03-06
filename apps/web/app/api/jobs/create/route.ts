@@ -1,3 +1,4 @@
+export const runtime = 'edge';
 import { createClient } from '@supabase/supabase-js';
 import { getRequiredEnv } from '@pat87creator/config/env';
 import { log } from '@pat87creator/logger';

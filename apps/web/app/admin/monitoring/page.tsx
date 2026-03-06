@@ -1,3 +1,4 @@
+export const runtime = 'edge';
 import { AdminMonitoringDashboard } from '../../../components/AdminMonitoringDashboard';
 
 type MonitoringPageProps = {

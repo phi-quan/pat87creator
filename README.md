@@ -47,11 +47,11 @@ npm run dev:web
 
 ## Cloudflare Pages configuration
 
-For production deployment of the web app, configure Cloudflare Pages with:
+For production deployment of the web app, configure Cloudflare Pages with the Cloudflare Next.js adapter enabled in the build step:
 
 - Root directory: `apps/web`
 - Build command: `npm run build`
-- Output directory: `.next`
+- Output directory: `.vercel/output/static`
 
 Required environment variables in Cloudflare Pages:
 
